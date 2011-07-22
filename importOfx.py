@@ -1090,14 +1090,18 @@ def datetime_to_unix(datetime):
   return long(time.mktime(datetime.timetuple()))
 
 
-def createPositionAdjustments():
+def createPositionAdjustments(adjust_positions):
   """ Adjust balances in commodity accounts so they would agree with OFX file POSLIST
   This should only be happenning on initial import, where the OFX file does not contain
   buy/sell transactions for the securities in POSLIST, or if some buy/sell transactions
-  are missing form the OFX file"""
+  are missing form the OFX file
+
+  if ADJUST_POSITOINS is passed, then do it, otherwise give a warning """
 
   global session, brokerAccount, ofx
   poslist = ofx.stmtResponse.positions
+
+  didWarn = False
 
   for pos in poslist:
     investment = pos.investment
@@ -1114,17 +1118,29 @@ def createPositionAdjustments():
       ofxBal *= 100
     
 
-    print '%s OFX balance=%s our balance=%s (net %s)' % (
-      getAccountPath(commAcc), ofxBal, bal, ofxBal - bal)
     otherAccount = None
-    desc = 'Adjustment from OFX file position'
+
     if bal != ofxBal:
+      didWarn = True
+      print '%s OFX balance=%s our balance=%s (net %s)' % (
+        getAccountPath(commAcc), ofxBal, bal, ofxBal - bal)
+      if not adjust_positions:
+        continue
       # adjust it
       otherAccount = findAccountByNameOrDie('Equity:Opening Balances')
+      desc = 'Adjustment from OFX file position'
 
       make_transaction(
         commAcc, otherAccount, ofxBal - bal, investment.unitPrice,
         date, desc)
+  if didWarn and not adjust_positions:
+    print "\n\nThere is a mistmatch between position sizes in OFX file and GnuCash."
+    print "This is normal if trades were performed only a few days ago, sometimes"
+    print "there is a delay of 3-5 days before trades settle and show up in OFX file"
+    print ""
+    print "If these positions were bought long time ago, or its the first time you are"
+    print "importing them into GnuCash, please run this script with -b option"
+    print "to create adjustments that will record the initial amount of shares you have"
 
 def updateCommodityPrices():
   """Update the commodities price table with prices from OFX file
@@ -1463,8 +1479,7 @@ def doMain(gnuCashFileName, ofxFileName, dontSave, adjust_positions):
   findBrokerAndCashAccount()
   updateTransactionList()
   # Now do final adjustments to balances as per OFX file
-  if adjust_positions:
-    createPositionAdjustments()
+  createPositionAdjustments(adjust_positions)
   if auto_create_prices:
     updateCommodityPrices()
   if not dontSave: session.save()
