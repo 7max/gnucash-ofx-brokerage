@@ -1181,7 +1181,7 @@ def updateCommodityPrices():
       p.set_source(code)
       pdb.add_price(p)
 
-def make_transaction(commAcc, otherAccount, shares, price, date, desc, taxExempt = False):
+def make_transaction(commAcc, otherAccount, shares, price, date, desc, taxExempt = False, transId = None):
   """Create two ends of a stock or mutual fund transaction. otherAccount
   must be a bank or other cash account.. otherAccount can be None then
   transaction will be unbalanced.
@@ -1202,6 +1202,8 @@ def make_transaction(commAcc, otherAccount, shares, price, date, desc, taxExempt
   tran.SetDescription(desc)
 
   tran.SetDatePostedSecs(datetime_to_unix(date))
+  if transId is not None:
+    tran.SetNotes(transId)
 
   s1 = Split(session.book)
   s1.SetParent(tran)
@@ -1221,7 +1223,7 @@ def make_transaction(commAcc, otherAccount, shares, price, date, desc, taxExempt
   gainsAccount = findAccountByNameOrDie(getIncomeAccountName("CGSHORT", taxExempt))
   s1.GetParent().ScrubGains(gainsAccount)
 
-def make_transaction2(firstAcc, otherAccount, tranType, amount, date, desc):
+def make_transaction2(firstAcc, otherAccount, tranType, amount, date, desc, transId = None):
   """Create two ends of a regular (not stock or mutual fund) account
   transaction.
 
@@ -1244,6 +1246,8 @@ def make_transaction2(firstAcc, otherAccount, tranType, amount, date, desc):
   tran.BeginEdit()
   tran.SetCurrency(brokerAccount.GetCommodity())
   tran.SetDescription(desc)
+  if transId is not None:
+    tran.SetNotes(transId)
 
   tran.SetDatePostedSecs(datetime_to_unix(date))
 
@@ -1306,7 +1310,7 @@ def findIfDuplicate(account, date, amount, memo, transId):
       transUnits = gnc_numeric_to_python_Decimal(split.GetAmount())
       transUnitPrice = gnc_numeric_to_python_Decimal(split.GetSharePrice()).quantize(Decimal('1.00'))
 
-      #print "Here units=%s unitPrice=%s transUnits=%s transUnitPrice=%s" % (units, unitPrice,
+      # print "Here units=%s unitPrice=%s transUnits=%s transUnitPrice=%s" % (units, unitPrice,
       #                                                                      transUnits, transUnitPrice)
       if units != transUnits or unitPrice != transUnitPrice:
         continue
@@ -1319,6 +1323,12 @@ def findIfDuplicate(account, date, amount, memo, transId):
     if transId is not None and transId != "" \
        and transNote == transId:
       return True
+
+    # print "Here transId = %s transNote=%s" % (transId, transNote)
+    # definitely not a dup, because we store transId in user-invisible note
+    if transId is not None and transId != "" and transNote is not None \
+       and transNote != "" and transNote != transId:
+      continue
 
     # If memo is non empty and equal, and less then 3 days apart, then a dup
     if daysApart <= 5 and memo is not None and memo == transMemo:
@@ -1371,7 +1381,7 @@ def updateTransactionList():
         tran2list[0].subAccountFund, tran2list[0].transaction)
       acc2 = getSubAccount(tran2list[0].subAccountFund)
       matched.append(tran2list[0])
-    make_transaction2(acc1, acc2, tranType, amount, timePosted, memo)
+    make_transaction2(acc1, acc2, tranType, amount, timePosted, memo, transId)
 
   #
   # Now update investment transactions
@@ -1415,7 +1425,7 @@ def updateTransactionList():
                         findAccountByNameOrDie(otherAccountName), 
                         'CREDIT',
                         amount,
-                        tradeDate, memo)
+                        tradeDate, memo, transId)
     elif isinstance(tran, BuyMFTransaction) \
     or isinstance(tran, SellMFTransaction) \
     or isinstance(tran, BuyOptionTransaction) \
@@ -1428,6 +1438,7 @@ def updateTransactionList():
     or isinstance(tran, SellOtherTransaction):
       investment = tran.investment
       invTran = investment.invTran
+      transId = invTran.transactionId
       secId = investment.securityId
       units = investment.units
       unitPrice = investment.unitPrice
@@ -1439,6 +1450,8 @@ def updateTransactionList():
       memo = invTran.memo
       tradeDate = invTran.tradeDate
       commAcc = getAccountForSecId(secId)
+
+      print "Processing investment transaction %s" % (transId)
 
       # Unfortunately there is no way to specify trade fraction
       # multiplier greater then one commodities, it would have been
@@ -1457,14 +1470,14 @@ def updateTransactionList():
       make_transaction(
         commAcc, getSubAccount(subAccount),
         units, unitPrice,
-        tradeDate, memo, taxExempt)
+        tradeDate, memo, taxExempt, transId)
       # account for commission and fees
       if commission + fees != Decimal('0.0'):
         make_transaction2(findAccountByNameOrDie(commissions_account),
                           getSubAccount(subAccount),
                           'CREDIT',
                           commission + fees,
-                          tradeDate, memo)
+                          tradeDate, memo, transId)
 
 def doMain(gnuCashFileName, ofxFileName, dontSave, adjust_positions):
   global session, brokeragesRoot, brokerAccount, soup, ofx
