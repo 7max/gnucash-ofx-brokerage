@@ -1,6 +1,7 @@
 #!/usr/bin/python
 
-import sys, os, time
+import warnings
+import sys, os, time, re
 import argparse
 from BeautifulSoup import *
 from gnucash import Session, Account, Transaction, Split, GncPrice, GncNumeric, GncCommodity, GncLot
@@ -25,7 +26,7 @@ def gnc_numeric_to_python_Decimal(numeric):
     copy = GncNumeric(numeric.num(), numeric.denom())
     result = copy.to_decimal(None)
     if not result:
-        raise Exception("gnc numeric value %s can't be converted to deciaml" %
+        raise Exception("gnc numeric value %s can't be converted to Decimal" %
                         copy.to_string() )
     digit_tuple = tuple( int(char)
                          for char in str(copy.num())
@@ -107,7 +108,8 @@ income_account_tax_exempt_root = 'Income:Tax Exempt'
 # 4. Interest Income
 # 5. All other income
 income_type_accounts = ('Long Term Capital Gains', 'Short Term Capital Gains',
-                        'Dividend Income', 'Interest Income', 'Other Income')
+                        'Dividend Income', 'Interest Income', 'Misc Income',
+                        'Futures P&L')
 
 # When OFX file has a position in some stock or mutual fund and after
 # processing and inserting buy/sell transactions GnuCash position does
@@ -156,15 +158,23 @@ class OfxElement:
     for c in self.children:
       if isinstance(c, str):
         recursive = False
+        required = True
         if c[0] == '*':
           c = c[1:]
           recursive = True
+        if c[0] == '?':
+          c = c[1:]
+          required = False
+        #print "Here finding %s, recursive=%s, required=%s " % (c, recursive, required)
         tmp = soup.find(c, recursive=recursive)
-        if tmp is None:
-          raise RuntimeError("""------- Missing required OFX attribute %s while parsing  -----
+        if tmp is None and required:
+          raise RuntimeError("""--%s-- Required attribute %s missing -----
 %s
---------------------------------------------------------------""" % (ofxName, soup.prettify()))
-        soup = tmp
+--------------------------------------------------------------""" % (self.__class__.__name__, c, soup.prettify()))
+        elif tmp is not None:
+          soup = tmp
+        else:
+          soup = BeautifulSoup()
         continue
       type,required,ofxName,isList = (str, True, None, False)
       name,c = c[0], c[1:]
@@ -187,15 +197,15 @@ class OfxElement:
       #print "here2 found=%s" % (elem)
       if len(elems) == 0: 
         if required:
-          raise RuntimeError("""------- Missing required OFX attribute %s while parsing  -----
+          raise RuntimeError("""--%s-- Required attribute %s missing -----
 %s
---------------------------------------------------------------""" % (ofxName, soup.prettify()))
+--------------------------------------------------------------""" % (self.__class__.__name__, ofxName, soup.prettify()))
         elif isList:
           self.__setattr__(name, [])
       elif len(elems) > 1 and not isList:
-          raise RuntimeError("""------- More then one %s element while parsing  -----
+          raise RuntimeError("""--%s-- More then one %s element while parsing  -----
 %s
---------------------------------------------------------------""" % (ofxName, soup.prettify()))
+--------------------------------------------------------------""" % (self.__class__.__name__, ofxName, soup.prettify()))
       else:
         result = None
         if isList:
@@ -251,7 +261,7 @@ def makeOfxClass(name, *elements):
 
 makeOfxClass('Ofx', ('signonResponse', 'SignOnResponse', True, '*sonrs'),
              ('stmtResponse', 'InvestmentStatementResponse', True, '*invstmttrnrs' ),
-             "*seclist",
+             "*?seclist",
              ('secList', 'parseSecurityInfo', False, True, True))
 
 # makeOfxClass('SignOnMsgSet', ('response', 'SignOnResponse', True, 'sonrs'))
@@ -264,7 +274,7 @@ makeOfxClass('SignOnResponse', ('status', 'TransactionStatus', True),
 makeOfxClass('TransactionStatus',
              ('code', int, True),
              ('severity',),
-             ('message',))
+             ('message',str,False))
 
 # makeOfxClass('FinancialInstitution', ('orgName', str, True, 'org'))
     
@@ -279,7 +289,7 @@ makeOfxClass('InvestmentStatementResponse',
              ('currencyCode', str, True, 'curdef'),
              ('investmentAccountFrom', 'InvestmentAccountDetails', True, '*invacctfrom'),
              ('transactions', 'InvestmentTransactionList', True, '*invtranlist'),
-             '*invposlist',
+             '*?invposlist',
              ('positions', 'parseInvestmentPosList', False, True, True))
 
 makeOfxClass('InvestmentAccountDetails',
@@ -461,6 +471,33 @@ makeOfxClass('SellStockTransaction',
              # OFX spec.
              ('type', str, True, 'selltype'))
 
+
+#transfer
+makeOfxClass('TransferTransaction',
+             ('invTran', 'BaseInvestmentTransaction', True, 'invtran'),
+             ('securityId', 'SecurityId', True, 'secid'),
+             # Gets the sub-account type. One of "CASH", "MARGIN",
+             # "SHORT", "OTHER". 
+             ('subAccountSec', str, False, 'subacctsec'),
+             # Gets the number of units of the security that was
+             # transferred. For security-based actions other than
+             # stock splits, this is the quantity bought. For stocks,
+             # mutual funds, and others, this is the number of
+             # shares. For bonds, this is the face value. For options,
+             # this is the number of contacts. This is a required
+             # field according to the OFX spec.
+             ('units', Decimal, True, 'units'),
+             # Gets the type of transfer. One of "IN" or "OUT". This
+             # is a required field according to the OFX spec.
+             ('unitPrice', Decimal, False, 'unitprice'),
+             ('purchaseDate', datetime, False, 'dtpurchase'),
+             ('transferAction', str, True, 'tferaction'),
+             # Gets the position type. One of SHORT or LONG. This is a
+             # required field according to the OFX spec.
+             ('type', str, True, 'postype'),
+             ('averageCostBasis', Decimal, False, 'avgcostbasis'),
+             ('inv401kSource', str, False, 'inv401ksource'))
+
 makeOfxClass('MarginInterestTransaction',
              ('invTran', 'BaseInvestmentTransaction', True, 'invtran'),
              ('subAccountFund', str, False, 'subacctfund'),
@@ -480,6 +517,18 @@ makeOfxClass('IncomeTransaction',
              ('total', Decimal, True, 'total'),
              ('taxExempt', bool, False, 'taxexempt'),
              ('withholding', Decimal, False, 'withholding'),
+             ('currencyCode', str, False, 'currency'),
+             ('originalCurrency', 'OfxCurrency', False, 'origcurrency'),
+             ('inv401kSource', str, False, 'inv401ksource'))
+
+makeOfxClass('ExpenseTransaction',
+             ('invTran', 'BaseInvestmentTransaction', True, 'invtran'),
+             ('securityId', 'SecurityId', True, 'secid'),
+             # Long or short term capital gains, dividends, or misc
+             # "CGLONG", CGSHORT", "DIV", "INTEREST", "MISC"
+             ('subAccountFund', str, False, 'subacctfund'),
+             ('subAccountSec', str, False, 'subacct'),
+             ('total', Decimal, True, 'total'),
              ('currencyCode', str, False, 'currency'),
              ('originalCurrency', 'OfxCurrency', False, 'origcurrency'),
              ('inv401kSource', str, False, 'inv401ksource'))
@@ -505,6 +554,10 @@ def parseInvestmentTransaction(soup):
     return MarginInterestTransaction(soup)
   elif soup.name == 'income':
     return IncomeTransaction(soup)
+  elif soup.name == 'invexpense':
+    return ExpenseTransaction(soup)
+  elif soup.name == 'transfer':
+    return TransferTransaction(soup)
   elif soup.name in ('dtstart', 'dtend', 'invbanktran'):
     return None
   else: 
@@ -832,8 +885,8 @@ def findOrCreateCommodity(uid, uidtype, ns, ticker, name):
   for c in getAllCommodities():
     if c.get_cusip() == uid:
       if ticker != c.get_mnemonic():
-        raise Exception(' CUSIP %s mistmatch. OFX file ticker %s and GnuCash ticker is %s'
-                        % (uid, ticker, c.get_mnemonic()))
+        warnings.warn ('CUSIP %s mistmatch. OFX file ticker %s and GnuCash ticker is %s. Will update ticker to match OFX file' % (uid, ticker, c.get_mnemonic()))
+        c.set_mnemonic(ticker)
       return c
   #print 'Creating commodity(%s, %s, %s, %s, %s, %s)' % (session.book, type(name), ns, ticker, uid, 10000)
   c = GncCommodity(session.book, name.encode(), ns.encode(), ticker.encode(), uid.encode(), 10000)
@@ -935,12 +988,10 @@ def getAccountForSecId(secId):
                      comm.get_unique_name()))
   commAcc.SetCode(key)
   # Fix it up so that account has lots
-  splits = commAcc.GetSplitList()
-  if len(splits) > 0:
-    last = splits[-1]
-    if last.GetLot() is None:
-      gainsAccount = findAccountByNameOrDie(getIncomeAccountName("CGSHORT", False))
-      last.GetParent().ScrubGains(gainsAccount)
+  # splits = commAcc.GetSplitList()
+  # if len(splits) > 0:
+  #   last = splits[-1]
+  #   last.GetParent().ScrubGains(gainsAccount)
   securityIdToAccountMap[key] = commAcc
   return commAcc
 
@@ -1057,12 +1108,14 @@ def findBrokerAndCashAccount():
                         ACCT_TYPE_INCOME)
 
 def convertOfxDateTime(dt):
-  dt = str(dt)
+  dt = re.sub('(\.[0-9]*)?\[.*\]$', '', str(dt))
   if len(dt) == 14:
     divisor = 10000000000
   elif len(dt) == 12:
     divisor = 100000000
-  else: raise Exception('Invalid datetime %s' % (dt))
+  elif len(dt) == 8:
+    divisor = 10000
+  else: raise Exception('Invalid datetime |%s|' % (dt))
   dt = int(dt)
   year = dt / divisor
   dt = dt % divisor
@@ -1073,17 +1126,22 @@ def convertOfxDateTime(dt):
   day = dt / divisor
   dt = dt % divisor
   divisor = divisor / 100
-  hour = dt / divisor
-  dt = dt % divisor
-  divisor = divisor / 100
-  minute = dt / divisor
-  dt = dt % divisor
-  divisor = divisor / 100
   if divisor > 0:
-    second = dt / divisor
+    hour = dt / divisor
     dt = dt % divisor
     divisor = divisor / 100
-  else: second = 0
+    minute = dt / divisor
+    dt = dt % divisor
+    divisor = divisor / 100
+    if divisor > 0:
+      second = dt / divisor
+      dt = dt % divisor
+      divisor = divisor / 100
+    else: second = 0
+  else:
+    hour = 0
+    minute = 0
+    second = 0
   return datetime(year, month, day, hour, minute, second)
 
 def datetime_to_unix(datetime):
@@ -1103,6 +1161,15 @@ def createPositionAdjustments(adjust_positions):
 
   didWarn = False
 
+  # Interactive brokers sends separate <posstock> entry for each lot. so its possible
+  # to have multiple entlies for same security
+  # sum entries for the same security first, then compare
+  
+  ofxBalances = {};
+
+  print "\n\n Scanning for balance mistmatches \n\n"
+
+
   for pos in poslist:
     investment = pos.investment
     secId = investment.securityId
@@ -1110,14 +1177,30 @@ def createPositionAdjustments(adjust_positions):
 
     commAcc = getAccountForSecId(secId)
 
-    bal = gnc_numeric_to_python_Decimal(commAcc.GetBalance())
     ofxBal = investment.units
 
     # we keep number of option shares as *100 in gnucash, so total value is correct
     if isinstance(pos, OptionsPosition):
       ofxBal *= 100
-    
 
+    key = secId.uniqueIdType + ':' + secId.uniqueId
+    if (not ofxBalances.has_key(key)):
+      ofxBalances[key] = {
+        'bal': Decimal('0.0'),
+        'secId': secId,
+        'date': date,
+        'price': investment.unitPrice
+      };
+    ofxBalances[key]['bal'] += ofxBal
+
+  for pos in ofxBalances.values():
+    secId = pos['secId']
+    date = pos['date']
+    ofxBal = pos['bal']
+    price = pos['price']
+
+    commAcc = getAccountForSecId(secId)
+    bal = gnc_numeric_to_python_Decimal(commAcc.GetBalance())
     otherAccount = None
 
     if bal != ofxBal:
@@ -1131,8 +1214,7 @@ def createPositionAdjustments(adjust_positions):
       desc = 'Adjustment from OFX file position'
 
       make_transaction(
-        commAcc, otherAccount, ofxBal - bal, investment.unitPrice,
-        date, desc)
+        commAcc, otherAccount, ofxBal - bal, price, date, desc)
   if didWarn and not adjust_positions:
     print "\n\nThere is a mistmatch between position sizes in OFX file and GnuCash."
     print "This is normal if trades were performed only a few days ago, sometimes"
@@ -1221,7 +1303,17 @@ def make_transaction(commAcc, otherAccount, shares, price, date, desc, taxExempt
   tran.CommitEdit()
 
   gainsAccount = findAccountByNameOrDie(getIncomeAccountName("CGSHORT", taxExempt))
-  s1.GetParent().ScrubGains(gainsAccount)
+  s1.GetParent().ScrubGains(None)
+  splits = commAcc.GetSplitList()
+  for s in splits:
+    other = s.GetOtherSplit()
+    if other.get_instance() is None:
+      continue
+    acc = other.GetAccount()
+    #print "Split %s" % (getAccountPath(acc))
+    if acc.GetName().find('Orphaned Gains-') == 0:
+      other.SetAccount(findAccountByNameOrDie(getIncomeAccountName("CGSHORT", taxExempt)))
+  
 
 def make_transaction2(firstAcc, otherAccount, tranType, amount, date, desc, transId = None):
   """Create two ends of a regular (not stock or mutual fund) account
@@ -1278,10 +1370,11 @@ def getIncomeAccountName(incomeType, taxExempt):
   elif incomeType == 'CGSHORT': name += income_type_accounts[1]
   elif incomeType == 'DIV': name += income_type_accounts[2]
   elif incomeType == 'INTEREST': name += income_type_accounts[3]
-  elif incomeType == 'MISC': name += income_type_accounts[5]
+  elif incomeType == 'MISC': name += income_type_accounts[4]
+  elif incomeType == 'FUTURE': name += income_type_accounts[5]
   else:
     print "Warning: unknown OFX income type %s" % (incomeType)
-    name += income_type_accounts[5]
+    name += income_type_accounts[4]
   return name
 
 def findIfDuplicate(account, date, amount, memo, transId):
@@ -1303,6 +1396,26 @@ def findIfDuplicate(account, date, amount, memo, transId):
     transNote = trans.GetNotes()
     transMemo = trans.GetDescription()
 
+    # definitely a dup, because we store transId in user-invisible note
+    # note that we match this before matching Units
+    #
+    # This is because the cap gains code can split teh actual transaciton into
+    # multiples, in order to match buy/sell lots
+    #
+    # For example if we bought 100 shares, then 200, then imported sell for 300, the
+    # 300 shares sell will be split into selling 100 and 200, in order to match
+    # the lots that we bought.
+    #
+    # Next time we try to re-import same sell 300 shares transation, a
+    # naive search for duplicate would search for 300 shares sold at
+    # same price on same day, which we won't find. So rely on
+    # transaction ID's being unique instead, and catch duplicate based
+    # on that. If there are transacitons with same transaction ids,
+    # then we are screwed
+    if transId is not None and transId != "" \
+       and transNote == transId:
+      return True
+
     if amount is not None:
       if amount != transAmount:
         continue
@@ -1313,21 +1426,20 @@ def findIfDuplicate(account, date, amount, memo, transId):
       # print "Here units=%s unitPrice=%s transUnits=%s transUnitPrice=%s" % (units, unitPrice,
       #                                                                      transUnits, transUnitPrice)
       if units != transUnits or unitPrice != transUnitPrice:
+        # print 'Units or price dont match'
         continue
 
     daysApart = abs((transDate - date).days)
     if daysApart > 5:
+      # print 'More then 5 days apart'
       continue
 
-    # definitely a dup, because we store transId in user-invisible note
-    if transId is not None and transId != "" \
-       and transNote == transId:
-      return True
 
-    # print "Here transId = %s transNote=%s" % (transId, transNote)
+    #print "Here transId = %s transNote=%s" % (transId, transNote)
     # definitely not a dup, because we store transId in user-invisible note
     if transId is not None and transId != "" and transNote is not None \
        and transNote != "" and transNote != transId:
+      #print 'Definitely not a dup'
       continue
 
     # If memo is non empty and equal, and less then 3 days apart, then a dup
@@ -1356,7 +1468,7 @@ def updateTransactionList():
 
     # Lets see if its a duplicate
     if findIfDuplicate(acc1, timePosted, amount, memo, transId):
-      print "Found suspected duplicate %s:%s skipping" % (tran.subAccountFund, tran.transaction)
+      #print "Found suspected duplicate %s:%s skipping" % (tran.subAccountFund, tran.transaction)
       continue
 
     # We don't have access to GUI here, so we can't popup GnuCash "find matching accoun"
@@ -1399,28 +1511,35 @@ def updateTransactionList():
     taxExempt = None
     inv401kSource = None
 
-    if isinstance(tran, MarginInterestTransaction) or isinstance(tran, IncomeTransaction):
+    if isinstance(tran, MarginInterestTransaction) or isinstance(tran, IncomeTransaction) \
+       or isinstance(tran, ExpenseTransaction):
       invTran = tran.invTran
       subAccount = tran.subAccountFund or tran.subAccountSec or 'CASH'
       amount = tran.total
       if isinstance(tran, MarginInterestTransaction):
         otherAccountName = commissions_account
       else:
-        # its income
         secId = tran.securityId
-        taxExempt = tran.taxExempt
-        inv401kSource = tran.inv401kSource
-        otherAccountName = getIncomeAccountName(tran.incomeType, taxExempt)
+        if isinstance(tran, IncomeTransaction):
+          taxExempt = tran.taxExempt
+          otherAccType = tran.incomeType
+        else: # its expense
+          taxExempt = False
+          otherAccType = 'MISC'
       memo = invTran.memo
+      if memo.find('FUTURE') == 0:
+        otherAccType = 'FUTURE'
+      otherAccountName = getIncomeAccountName(otherAccType, taxExempt)
       transId = invTran.transactionId
       tradeDate = invTran.tradeDate
       subAccount = getSubAccount(subAccount)
 
       # Lets see if its a duplicate
       if findIfDuplicate(subAccount, tradeDate, amount, memo, transId):
-        print "Found suspected duplicate %s skipping" % (tran)
+        #print "Found suspected duplicate %s skipping" % (tran)
         continue
 
+      print "NEW transaction %s" % (tran)
       make_transaction2(subAccount,
                         findAccountByNameOrDie(otherAccountName), 
                         'CREDIT',
@@ -1432,10 +1551,25 @@ def updateTransactionList():
     or isinstance(tran, SellOptionTransaction) \
     or isinstance(tran, BuyStockTransaction) \
     or isinstance(tran, SellStockTransaction) \
-    or isinstance(tran, BuyDebtkTransaction) \
+    or isinstance(tran, BuyDebtTransaction) \
     or isinstance(tran, SellDebtTransaction) \
     or isinstance(tran, BuyOtherTransaction) \
     or isinstance(tran, SellOtherTransaction):
+      tranType = ''
+      if isinstance(tran, BuyMFTransaction) \
+         or isinstance(tran, SellMFTransaction) \
+         or isinstance(tran, BuyOptionTransaction) \
+         or isinstance(tran, SellOptionTransaction) \
+         or isinstance(tran, BuyStockTransaction) \
+         or isinstance(tran, SellStockTransaction):
+        tranType = tran.type
+        if tranType is None or tranType == '':
+          if isinstance(tran, BuyMFTransaction): tranType = 'Buy Mutual Fund'
+          elif isinstance(tran, BuyOptionTransaction): tranType = 'Buy Option'
+          elif isinstance(tran, BuyStockTransaction):  tranType = 'Buy Stock'
+          elif isinstance(tran, SellMFTransaction): tranType = 'Sell Mutual Fund'
+          elif isinstance(tran, SellOptionTransaction): tranType = 'Sell Option'
+          elif isinstance(tran, SellStockTransaction):  tranType = 'Sell Stock'
       investment = tran.investment
       invTran = investment.invTran
       transId = invTran.transactionId
@@ -1450,8 +1584,20 @@ def updateTransactionList():
       memo = invTran.memo
       tradeDate = invTran.tradeDate
       commAcc = getAccountForSecId(secId)
+      comm = getCommodityForSecId(secId)
 
-      print "Processing investment transaction %s" % (transId)
+      # if memo line is empty, make a memory line
+      if memo is None or memo == '':
+        memo = tranType
+        if memo != '': memo += ' '
+        memo += comm.get_mnemonic()
+      elif tranType != '' and memo.lower().find('buy') == -1 \
+           and memo.lower().find('sell') == -1 \
+           and memo.lower().find('cover') == -1 \
+           and memo.lower().find('short') == -1:
+        memo = tranType + ' ' + memo
+
+      #print "Processing investment transaction %s" % (transId)
 
       # Unfortunately there is no way to specify trade fraction
       # multiplier greater then one commodities, it would have been
@@ -1464,9 +1610,10 @@ def updateTransactionList():
 
       # Lets see if its a duplicate
       if findIfDuplicate(commAcc, tradeDate, (units, unitPrice), memo, transId):
-        print "Found suspected duplicate %s %s skipping" % (tran.__class__.__name__, tran.investment)
+        #print "Found suspected duplicate %s %s skipping" % (tran.__class__.__name__, tran.investment)
         continue
 
+      print "NEW investemnt transaction %s" % (tran)
       make_transaction(
         commAcc, getSubAccount(subAccount),
         units, unitPrice,
@@ -1478,6 +1625,55 @@ def updateTransactionList():
                           'CREDIT',
                           commission + fees,
                           tradeDate, memo, transId)
+    elif isinstance(tran, TransferTransaction):
+      invTran = tran.invTran
+      investment = tran
+      secId = investment.securityId
+      units = investment.units
+      unitPrice = investment.unitPrice or Decimal('0.0')
+      tranType = 'Transfer ' + tran.transferAction
+
+      transId = invTran.transactionId
+      subAccount = investment.subAccountSec or 'CASH'
+      memo = invTran.memo
+      tradeDate = invTran.tradeDate
+      sec = getSecListEntry(secId)
+      commAcc = getAccountForSecId(secId)
+      comm = getCommodityForSecId(secId)
+
+      # if memo line is empty, make a memory line
+      if memo is None or memo == '':
+        memo = tranType
+        if memo != '': memo += ' '
+        memo += comm.get_mnemonic()
+      elif tranType != '' and memo.lower().find('buy') == -1 \
+           and memo.lower().find('sell') == -1 \
+           and memo.lower().find('cover') == -1 \
+           and memo.lower().find('assign') == -1 \
+           and memo.lower().find('short') == -1:
+        memo = tranType + ' ' + memo
+
+      #print "Processing investment transaction %s" % (transId)
+
+      # Unfortunately there is no way to specify trade fraction
+      # multiplier greater then one commodities, it would have been
+      # cooler to have option's commodity have min trade fraction of 100/1
+      #
+      # Instead in GnuCash we count option contrans in number of
+      # shares that they buy, rather then in contracts themself
+      if isinstance(sec, OptionSecurityInfo):
+        units *= sec.sharesPerContract
+
+      # Lets see if its a duplicate
+      if findIfDuplicate(commAcc, tradeDate, (units, unitPrice), memo, transId):
+        #print "Found suspected duplicate %s %s skipping" % (tran.__class__.__name__, tran.investment)
+        continue
+
+      print "NEW transfer transaction %s" % (tran)
+      make_transaction(
+        commAcc, getSubAccount(subAccount),
+        units, unitPrice,
+        tradeDate, memo, taxExempt, transId)
 
 def doMain(gnuCashFileName, ofxFileName, dontSave, adjust_positions):
   global session, brokeragesRoot, brokerAccount, soup, ofx
@@ -1500,8 +1696,7 @@ def doMain(gnuCashFileName, ofxFileName, dontSave, adjust_positions):
 
 
 dbg_gcfile='/home/max/Documents/Finances/test.gnucash'
-dbg_ofxfile='/home/max/ameritrade20110719.ofx'
-dbg_dontsave = True
+dbg_ofxfile='/home/max/ib-ofx/ib_20110729.ofx'
 
 
 def main():
@@ -1513,7 +1708,8 @@ def main():
   args = parser.parse_args()
   doMain(args.gnuCashFile, args.ofxFile, args.dontSave, args.adjustBalances)
 
-def dbg_main():
+def dbg_main(gcfile=dbg_gcfile, ofxFile=dbg_ofxfile):
   doMain(dbg_gcfile, dbg_ofxfile, True, False)
 
-main()
+if (os.getenv('INSIDE_EMACS') is None):
+  main()

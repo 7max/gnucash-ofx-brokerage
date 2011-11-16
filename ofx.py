@@ -1,6 +1,7 @@
 #!/usr/bin/python
 import time, os, httplib, urllib2
 import sys
+import argparse
 
 join = str.join
 
@@ -163,23 +164,26 @@ class OFXClient:
         # ...
 
 import getpass
-argv = sys.argv
 if __name__=="__main__":
-    dtstart = time.strftime("%Y%m%d",time.localtime(time.time()-31*86400))
+
+    parser = argparse.ArgumentParser(description="Download OFX file from an institution")
+    parser.add_argument('site', metavar='site', help='One of ameritrade, ucard or discover')
+    parser.add_argument('username', metavar='<username>')
+    parser.add_argument('account', nargs='?', metavar='<account>')
+    parser.add_argument('-d', dest='ndays', type=int, default=31, help='Number of days to download')
+    args = parser.parse_args()
+
+    dtstart = time.strftime("%Y%m%d",time.localtime(time.time()-args.ndays*86400))
     dtnow = time.strftime("%Y%m%d",time.localtime())
-    if len(argv) < 3:
-        print "Usage:",sys.argv[0], "site user [account]"
-        print "available sites:",join(", ",sites.keys())
-        sys.exit()
     passwd = getpass.getpass()
-    client = OFXClient(sites[argv[1]], argv[2], passwd)
-    if len(argv) < 4:
+    client = OFXClient(sites[args.site], args.username, passwd)
+    if args.account is None:
        query = client.acctQuery("19700101000000")
-       client.doQuery(query, argv[1]+"_acct.ofx") 
+       client.doQuery(query, args.site+"_acct.ofx") 
     else:
-       if "CCSTMT" in sites[argv[1]]["caps"]:
-          query = client.ccQuery(sys.argv[3], dtstart)
-       elif "INVSTMT" in sites[argv[1]]["caps"]:
-          query = client.invstQuery(sites[argv[1]]["fiorg"], sys.argv[3], dtstart)
-       client.doQuery(query, argv[1]+dtnow+".ofx")
+       if "CCSTMT" in sites[args.site]["caps"]:
+          query = client.ccQuery(args.account, dtstart)
+       elif "INVSTMT" in sites[args.site]["caps"]:
+          query = client.invstQuery(sites[args.site]["fiorg"], args.account, dtstart)
+       client.doQuery(query, args.site+dtnow+".ofx")
 
