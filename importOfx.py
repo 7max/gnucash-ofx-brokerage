@@ -885,14 +885,40 @@ def findOrCreateCommodity(uid, uidtype, ns, ticker, name):
   for c in getAllCommodities():
     if c.get_cusip() == uid:
       if ticker != c.get_mnemonic():
-        warnings.warn ('CUSIP %s mistmatch. OFX file ticker %s and GnuCash ticker is %s. Will update ticker to match OFX file' % (uid, ticker, c.get_mnemonic()))
-        c.set_mnemonic(ticker)
+        comm = checkCommodityForRename(uid, ticker)
+        if comm is not None:
+          global securityIdToCommodityMap
+          key = uidtype + ':' + uid
+          securityIdToCommodityMap[key] = comm
+          # print "Changed hash on renamed commodity %s => %s, %s" % (secId, comm.get_instance(),
+          #                                                           hasattr(comm, 'old_mnemonic'))
+          return comm
+        raise Exception("Found commodity cusip %s with mnemonic %s not matching %s" %
+                        (uid, c.get_mnemonic(), ticker))
       return c
-  #print 'Creating commodity(%s, %s, %s, %s, %s, %s)' % (session.book, type(name), ns, ticker, uid, 10000)
+  # print 'Creating commodity(%s, %s, %s, %s, %s, %s)' % (session.book, type(name), ns, ticker, uid, 10000)
   c = GncCommodity(session.book, name.encode(), ns.encode(), ticker.encode(), uid.encode(), 10000)
   c.set_quote_flag(True)
   c.set_quote_source(gnc_quote_source_lookup_by_internal("yahoo"))
   return comtab.insert(c)
+
+def checkCommodityForRename(uid, ticker):
+  global session
+
+  # print "Checking commodity %s for rename, ticker %s" % (uid, ticker)
+  comtab = session.book.get_table()
+
+  for c in getAllCommodities():
+    if c.get_cusip() == uid:
+      # print "Found same cusip, mnemonic=%s" % (c.get_mnemonic())
+      if ticker != c.get_mnemonic():
+        print "Commodity %s renamed to %s" % (c.get_mnemonic(), ticker)
+        c.old_mnemonic = c.get_mnemonic()
+        comtab.remove(c)
+        c.set_mnemonic(ticker)
+        comtab.insert(c)
+      return c
+  return None
 
 def getSecListEntry(secId):
   """Return security description from SECLIST based on security id"""
@@ -908,17 +934,22 @@ def getCommodityForSecId(secId):
   global securityIdToCommodityMap
   key = secId.uniqueIdType + ':' + secId.uniqueId
   if securityIdToCommodityMap.has_key(key):
-    return securityIdToCommodityMap[key]
+    comm = securityIdToCommodityMap[key]
+    return comm
   if auto_create_commodity_accounts:
     # find ticker in seclist
     security = getSecListEntry(secId)
     info = security.securityInfo
-    ret = findOrCreateCommodity(secId.uniqueId, secId.uniqueIdType,
-                                security.commodityNamespace,
-                                info.ticker, info.securityName) 
-    securityIdToCommodityMap[key] = ret
-    return ret
+    comm = findOrCreateCommodity(secId.uniqueId, secId.uniqueIdType,
+                                 security.commodityNamespace,
+                                 info.ticker, info.securityName) 
+    securityIdToCommodityMap[key] = comm
+    # print "Created commodity %s => %s, %s" % (secId, comm.get_instance(),
+    #                                           hasattr(comm, 'old_mnemonic'))
+    return comm
   raise Exception('Unable to find commodity for securityId %s' % (secid))
+
+
 
 def getAccountForSecId(secId):
   global session, brokerAccount, ofx, securityIdToAccountMap
@@ -937,6 +968,8 @@ def getAccountForSecId(secId):
   if comm.get_namespace() != secns:
     raise Exception('GnuCash commodity %s:%s (cusip %s) namespace mistmatch (must be %s)'\
                     % (comm.get_namespace(), comm.get_mnemonic(), secId.uniqueId, secns))
+
+  # print "comm cusip = %s mnemonic=%s secid=%s" % (comm.get_cusip(), comm.get_mnemonic(), secId)
 
   parent = brokerAccount
   prefix = ''
@@ -971,12 +1004,21 @@ def getAccountForSecId(secId):
 
   commAcc = parent.lookup_by_code(key)
   if commAcc.get_instance() is None:
+    # print "Account by code %s not found, trying name %s" % (key, comm.get_mnemonic())
     commAcc = parent.lookup_by_name(comm.get_mnemonic())
+    if commAcc.get_instance() is not None:
+      # print "Found account by name, code %s commodity %s" % (commAcc.GetCode(),
+      #                                                        commAcc.GetCommodity().get_cusip())
+      # see if its different valid account with the correct commodity and code
+      foundCusip  = commAcc.GetCommodity().get_cusip()
+      if len(foundCusip) > 0 and commAcc.GetCode()[-len(foundCusip):] == foundCusip:
+        # print "Ignoring account %s code %s" % (commAcc.GetName(), commAcc.GetCode())
+        commAcc = Account(instance=None)
+
 
   if commAcc.get_instance() is None:
     if auto_create_commodity_accounts:
-      commAcc = findOrMakeAccount((comm.get_mnemonic(),),
-                                     parent, session.book, comm, acct_type)
+      commAcc = makeCommodityAccount(session.book, parent, comm, acct_type)
     else:
       raise Exception('Account for commodity %s does not exist under %s' \
                       % (comm.get_unique_name(), getAccountPath(parent)))
@@ -986,7 +1028,10 @@ def getAccountForSecId(secId):
                     % (getAccountPath(commAcc),
                      commAcc.GetCommodity().get_unique_name(),
                      comm.get_unique_name()))
-  commAcc.SetCode(key)
+  if commAcc.GetCode() != key:
+    if commAcc.GetCode() != '':
+      print "Changing account code from %s to %s" % (commAcc.GetCode(), key)
+    commAcc.SetCode(key)
   # Fix it up so that account has lots
   # splits = commAcc.GetSplitList()
   # if len(splits) > 0:
@@ -1027,6 +1072,14 @@ def findOrMakeAccount(account_tuple, root_account, book,
         return current_account
       else:
         return None
+
+def makeCommodityAccount(book, parent, comm, acct_type ):
+  acc = Account(book)
+  acc.SetName(comm.get_mnemonic())
+  acc.SetCommodity(comm)
+  acc.SetType(acct_type)
+  parent.append_child(acc)
+  return acc
 
 def findOrCreateBrokerAccount(parent, name, acctId, currency, acctType, searchByName = False):
   global session
@@ -1176,7 +1229,6 @@ def createPositionAdjustments(adjust_positions):
     date = investment.marketValueDate
 
     commAcc = getAccountForSecId(secId)
-
     ofxBal = investment.units
 
     # we keep number of option shares as *100 in gnucash, so total value is correct
@@ -1200,6 +1252,7 @@ def createPositionAdjustments(adjust_positions):
     price = pos['price']
 
     commAcc = getAccountForSecId(secId)
+
     bal = gnc_numeric_to_python_Decimal(commAcc.GetBalance())
     otherAccount = None
 
@@ -1238,6 +1291,7 @@ def updateCommodityPrices():
     date = investment.marketValueDate
 
     commAcc = getAccountForSecId(secId)
+
     pdb = session.book.get_price_db()
 
     prices = pdb.get_prices(commAcc.GetCommodity(),
@@ -1263,7 +1317,9 @@ def updateCommodityPrices():
       p.set_source(code)
       pdb.add_price(p)
 
-def make_transaction(commAcc, otherAccount, shares, price, date, desc, taxExempt = False, transId = None):
+def make_transaction(commAcc, otherAccount, shares, price, date, desc, taxExempt = False,
+                     transId = None,
+                     scrabGains = True):
   """Create two ends of a stock or mutual fund transaction. otherAccount
   must be a bank or other cash account.. otherAccount can be None then
   transaction will be unbalanced.
@@ -1302,18 +1358,20 @@ def make_transaction(commAcc, otherAccount, shares, price, date, desc, taxExempt
 
   tran.CommitEdit()
 
-  gainsAccount = findAccountByNameOrDie(getIncomeAccountName("CGSHORT", taxExempt))
-  s1.GetParent().ScrubGains(None)
-  splits = commAcc.GetSplitList()
-  for s in splits:
-    other = s.GetOtherSplit()
-    if other.get_instance() is None:
-      continue
-    acc = other.GetAccount()
-    #print "Split %s" % (getAccountPath(acc))
-    if acc.GetName().find('Orphaned Gains-') == 0:
-      other.SetAccount(findAccountByNameOrDie(getIncomeAccountName("CGSHORT", taxExempt)))
-  
+  if scrabGains:
+    print "Scrabbing gains"
+    gainsAccount = findAccountByNameOrDie(getIncomeAccountName("CGSHORT", taxExempt))
+    s1.GetParent().ScrubGains(None)
+    splits = commAcc.GetSplitList()
+    for s in splits:
+      other = s.GetOtherSplit()
+      print "Processing split=%s other=%s" % (s, other)
+      if other.get_instance() is None:
+        continue
+      acc = other.GetAccount()
+      print "Split %s" % (getAccountPath(acc))
+      if acc.GetName().find('Orphaned Gains-') == 0:
+        other.SetAccount(findAccountByNameOrDie(getIncomeAccountName("CGSHORT", taxExempt)))
 
 def make_transaction2(firstAcc, otherAccount, tranType, amount, date, desc, transId = None):
   """Create two ends of a regular (not stock or mutual fund) account
@@ -1360,6 +1418,7 @@ def make_transaction2(firstAcc, otherAccount, tranType, amount, date, desc, tran
     s2.SetValue(s1.GetValue().neg())
 
   tran.CommitEdit()
+  return s1
 
 def getIncomeAccountName(incomeType, taxExempt):
   "Return full GnuCash account name for where income should go."
@@ -1435,11 +1494,11 @@ def findIfDuplicate(account, date, amount, memo, transId):
       continue
 
 
-    #print "Here transId = %s transNote=%s" % (transId, transNote)
+    # print "Here transId = %s transNote=%s" % (transId, transNote)
     # definitely not a dup, because we store transId in user-invisible note
     if transId is not None and transId != "" and transNote is not None \
        and transNote != "" and transNote != transId:
-      #print 'Definitely not a dup'
+      # print 'Definitely not a dup'
       continue
 
     # If memo is non empty and equal, and less then 3 days apart, then a dup
@@ -1450,7 +1509,90 @@ def findIfDuplicate(account, date, amount, memo, transId):
     if daysApart <= 2:
       return True
   return False
+
+def handleRenamedCommodities():
+  """Ensure that we have every commodity and account, this handles renames as well"""
+  global ofx
+  for sec in ofx.secList:
+    secId = sec.securityInfo.securityId
+    comm = checkCommodityForRename(secId.uniqueId, sec.securityInfo.ticker)
+    if comm is not None:
+      global securityIdToCommodityMap
+      key = secId.uniqueIdType + ':' + secId.uniqueId
+      securityIdToCommodityMap[key] = comm
+      # print "Changed hash on renamed commodity %s => %s, %s" % (secId, comm.get_instance(),
+      #                                                           hasattr(comm, 'old_mnemonic'))
+  for sec in ofx.secList:
+    secId = sec.securityInfo.securityId
+    comm = getCommodityForSecId(secId)
+    acc = getAccountForSecId(secId)
+
+def isOppositeTransferTransaction(acc1, tran1, tran2):
+  if not isinstance(tran1, TransferTransaction) \
+     or not isinstance(tran2, TransferTransaction): return False
+
+  if tran1.units != -tran2.units:
+    # print "here0 tran1.units=%s tran2.units=%s" % (tran1.units, tran2.units)
+    return False
+
+  if tran1.unitPrice != tran2.unitPrice:
+    # print "here2"
+    return False
+
+  if tran1.invTran.tradeDate != tran2.invTran.tradeDate:
+    # print "here3"
+    return False
+
+  if tran1.subAccountSec != tran2.subAccountSec:
+    # print "here4"
+    return False
+
+  if tran1.type != tran2.type:
+    # print "here44"
+    return False
+
+  if (tran1.transferAction == "OUT" and tran2.transferAction != "IN"):
+    # print "here5"
+    return False
+
+  if (tran1.transferAction == "IN" and tran2.transferAction != "OUT"):
+    # print "here6"
+    return False
   
+
+  secId1 = tran1.securityId
+  secId2 = tran2.securityId
+
+  comm1 = acc1.GetCommodity()
+  comm2 = getCommodityForSecId(secId2)
+
+  mnem1 = comm1.old_mnemonic if hasattr(comm1, 'old_mnemonic') else comm1.get_mnemonic()
+  mnem2 = comm2.old_mnemonic if hasattr(comm2, 'old_mnemonic') else comm2.get_mnemonic()
+
+  cusip1 = comm1.get_cusip()
+  cusip2 = comm2.get_cusip()
+
+  # ok if either ticker or cusip is unchanged, then consider it a rename
+  if mnem1 != mnem2 and cusip1 != cusip2:
+    # print "Here7 mnem1=%s mnem2=%s cusip1=%s cusip2=%s" % (mnem1,
+    #                                                        mnem2,
+    #                                                        cusip1, cusip2)
+    return False
+
+  acc2 = getAccountForSecId(secId2)
+
+  bal1 = abs(gnc_numeric_to_python_Decimal(acc1.GetBalance())) 
+  bal2 = abs(gnc_numeric_to_python_Decimal(acc2.GetBalance())) 
+
+  if (bal1 == 0 and abs(bal2) == abs(tran1.units)) \
+     or (bal2 == 0 and abs(bal1) == abs(tran1.units)):
+    # print "Here8 returning True"
+    return True
+  else:
+    # print "here9 bal1 = %s tran1.units = %s bal2 = %s " \
+    # % (bal1, tran1.units, bal2)
+    return False
+
 def updateTransactionList():
   """Copy the banking and investment transactions from OFX file """
   global session, brokerAccount, ofx
@@ -1613,7 +1755,7 @@ def updateTransactionList():
         #print "Found suspected duplicate %s %s skipping" % (tran.__class__.__name__, tran.investment)
         continue
 
-      print "NEW investemnt transaction %s" % (tran)
+      print "NEW investment transaction %s" % (tran)
       make_transaction(
         commAcc, getSubAccount(subAccount),
         units, unitPrice,
@@ -1653,7 +1795,8 @@ def updateTransactionList():
            and memo.lower().find('short') == -1:
         memo = tranType + ' ' + memo
 
-      #print "Processing investment transaction %s" % (transId)
+      print "Processing transfer transaction %s secid=%s comm_unique_name=%s" \
+        % (transId, secId, comm.get_unique_name())
 
       # Unfortunately there is no way to specify trade fraction
       # multiplier greater then one commodities, it would have been
@@ -1661,19 +1804,82 @@ def updateTransactionList():
       #
       # Instead in GnuCash we count option contrans in number of
       # shares that they buy, rather then in contracts themself
+
+      doScrab = False
+
       if isinstance(sec, OptionSecurityInfo):
         units *= sec.sharesPerContract
+        doScrab = True
 
       # Lets see if its a duplicate
       if findIfDuplicate(commAcc, tradeDate, (units, unitPrice), memo, transId):
-        #print "Found suspected duplicate %s %s skipping" % (tran.__class__.__name__, tran.investment)
+        print "Found suspected duplicate %s %s skipping" % (tran.__class__.__name__, tran)
         continue
 
-      print "NEW transfer transaction %s" % (tran)
-      make_transaction(
-        commAcc, getSubAccount(subAccount),
-        units, unitPrice,
-        tradeDate, memo, taxExempt, transId)
+      acc2 = None
+      tran2list = [tran2 for tran2 in ofx.stmtResponse.transactions.investmentTransactions
+                   if tran2 != tran and isOppositeTransferTransaction(commAcc, tran, tran2) ]
+                     
+      tran2 = None
+
+      # print "Here tran2list = %s" % (len(tran2list))
+      if len(tran2list) == 1:
+        tran2 = tran2list[0]
+
+      if tran2 is not None:
+        if tran.transferAction == "OUT":
+          print "Skipping OUT transaction %s for internal transfer" % (tran)
+          continue
+
+        # print "Found internal transfer match, will copy splits %s" % (tran2)
+        acc1 = commAcc
+        acc2 = getAccountForSecId(tran2.securityId)
+
+        # Lets see if its a duplicate
+        if findIfDuplicate(acc2, tradeDate, (Decimal('0'), Decimal('0')), memo, transId):
+          print "Found suspected duplicate %s %s skipping" % (tran.__class__.__name__, tran)
+          continue
+
+        comm1 = acc1.GetCommodity()
+        comm2 = acc2.GetCommodity()
+
+        bal1 = gnc_numeric_to_python_Decimal(acc1.GetBalance()) 
+        bal2 = gnc_numeric_to_python_Decimal(acc2.GetBalance())
+
+        print "Here bal1=%s bal2=%s tran.units=%s" % (bal1, bal2, tran.units)
+        assert tran.transferAction == "IN"
+        assert bal1 == 0
+        assert bal2 == tran.units
+
+        # now rename the accounts
+        key1 = secId.uniqueIdType + ':' + secId.uniqueId
+        key2 = tran2.securityId.uniqueIdType + ':' + tran2.securityId.uniqueId
+        
+        acc2.SetCommodity(comm1)
+        acc2.SetCode(key1)
+        acc1.SetCommodity(comm2)
+        acc1.SetCode(key2)
+
+        global securityIdToAccountMap
+
+        securityIdToAccountMap[key1] = acc2
+        securityIdToAccountMap[key2] = acc1
+
+        print "NEW internal transfer transaction %s" % (tran)
+        make_transaction(
+          commAcc, getSubAccount(subAccount),
+          Decimal('0'), Decimal('0'),
+          tradeDate, memo, taxExempt, transId,
+          scrabGains = False )
+
+      else:
+        print "NEW transfer transaction %s doScrab=%s" % (tran, doScrab)
+        make_transaction(
+          commAcc, getSubAccount(subAccount),
+          units, unitPrice,
+          tradeDate, memo, taxExempt, transId,
+          scrabGains = doScrab )
+
 
 def doMain(gnuCashFileName, ofxFileName, dontSave, adjust_positions):
   global session, brokeragesRoot, brokerAccount, soup, ofx
@@ -1686,6 +1892,7 @@ def doMain(gnuCashFileName, ofxFileName, dontSave, adjust_positions):
   ofx = Ofx(soup);
 
   findBrokerAndCashAccount()
+  #handleRenamedCommodities()
   updateTransactionList()
   # Now do final adjustments to balances as per OFX file
   createPositionAdjustments(adjust_positions)
@@ -1695,8 +1902,8 @@ def doMain(gnuCashFileName, ofxFileName, dontSave, adjust_positions):
   else: print "Gnucash file was not saved (dry run)"
 
 
-dbg_gcfile='/home/max/Documents/Finances/test.gnucash'
-dbg_ofxfile='/home/max/ib-ofx/ib_20110729.ofx'
+dbg_gcfile='/home/max/Documents/Finances/test2.gnucash'
+dbg_ofxfile='/home/max/Documents/Finances/viv.ofx'
 
 
 def main():
