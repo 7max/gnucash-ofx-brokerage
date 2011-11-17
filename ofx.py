@@ -2,6 +2,8 @@
 import time, os, httplib, urllib2
 import sys
 import argparse
+import calendar
+from datetime import datetime
 
 join = str.join
 
@@ -87,18 +89,18 @@ class OFXClient:
                         _field("INCLUDE","Y")))
         return self._message("CREDITCARD","CCSTMT",req)
 
-    def _invstreq(self, brokerid, acctid, dtstart):
-        dtnow = time.strftime("%Y%m%d%H%M%S",time.localtime())
+    def _invstreq(self, brokerid, acctid, dtstart, dtend):
         req = _tag("INVSTMTRQ",
                    _tag("INVACCTFROM",
                       _field("BROKERID", brokerid),
                       _field("ACCTID",acctid)),
                    _tag("INCTRAN",
                         _field("DTSTART",dtstart),
+                        _field("DTEND",dtend),
                         _field("INCLUDE","Y")),
                    _field("INCOO","Y"),
                    _tag("INCPOS",
-                        _field("DTASOF", dtnow),
+                        _field("DTASOF", dtend),
                         _field("INCLUDE","Y")),
                    _field("INCBAL","Y"))
         return self._message("INVSTMT","INVSTMT",req)
@@ -136,11 +138,11 @@ class OFXClient:
                                self._signOn(),
                                self._acctreq(dtstart))])
 
-    def invstQuery(self, brokerid, acctid, dtstart):
+    def invstQuery(self, brokerid, acctid, dtstart, dtend):
         return join("\r\n",[self._header(),
                           _tag("OFX",
                                self._signOn(),
-                               self._invstreq(brokerid, acctid,dtstart))])
+                               self._invstreq(brokerid, acctid,dtstart,dtend))])
 
     def doQuery(self,query,name):
         # N.B. urllib doesn't honor user Content-type, use urllib2
@@ -171,10 +173,18 @@ if __name__=="__main__":
     parser.add_argument('username', metavar='<username>')
     parser.add_argument('account', nargs='?', metavar='<account>')
     parser.add_argument('-d', dest='ndays', type=int, default=31, help='Number of days to download')
+    parser.add_argument('-m', dest='month', type=int, help='month')
     args = parser.parse_args()
 
-    dtstart = time.strftime("%Y%m%d",time.localtime(time.time()-args.ndays*86400))
-    dtnow = time.strftime("%Y%m%d",time.localtime())
+    if args.month is not None:
+      dtstart = datetime.now().replace( month = args.month, day = 1)
+      dtend = dtstart.replace(day = calendar.monthrange(dtstart.year, dtstart.month)[1])
+      dtstart = dtstart.strftime("%Y%m%d")
+      dtend = dtend.strftime("%Y%m%d")
+    else:
+      dtstart = time.strftime("%Y%m%d",time.localtime(time.time()-args.ndays*86400))
+      dtend = time.strftime("%Y%m%d",time.localtime())
+    # print "dtstart=%s dtend=%s" % (dtstart, dtend)
     passwd = getpass.getpass()
     client = OFXClient(sites[args.site], args.username, passwd)
     if args.account is None:
@@ -184,6 +194,6 @@ if __name__=="__main__":
        if "CCSTMT" in sites[args.site]["caps"]:
           query = client.ccQuery(args.account, dtstart)
        elif "INVSTMT" in sites[args.site]["caps"]:
-          query = client.invstQuery(sites[args.site]["fiorg"], args.account, dtstart)
-       client.doQuery(query, args.site+dtnow+".ofx")
+          query = client.invstQuery(sites[args.site]["fiorg"], args.account, dtstart, dtend)
+       client.doQuery(query, args.site+dtend+".ofx")
 

@@ -881,44 +881,32 @@ def findOrCreateCommodity(uid, uidtype, ns, ticker, name):
   global session
 
   comtab = session.book.get_table()
-
-  for c in getAllCommodities():
-    if c.get_cusip() == uid:
-      if ticker != c.get_mnemonic():
-        comm = checkCommodityForRename(uid, ticker)
-        if comm is not None:
-          global securityIdToCommodityMap
-          key = uidtype + ':' + uid
-          securityIdToCommodityMap[key] = comm
-          # print "Changed hash on renamed commodity %s => %s, %s" % (secId, comm.get_instance(),
-          #                                                           hasattr(comm, 'old_mnemonic'))
-          return comm
-        raise Exception("Found commodity cusip %s with mnemonic %s not matching %s" %
-                        (uid, c.get_mnemonic(), ticker))
+  c = comtab.lookup_unique(uidtype + "::" + uid)
+  if c.get_instance() is not None:
       return c
-  # print 'Creating commodity(%s, %s, %s, %s, %s, %s)' % (session.book, type(name), ns, ticker, uid, 10000)
-  c = GncCommodity(session.book, name.encode(), ns.encode(), ticker.encode(), uid.encode(), 10000)
+  print 'Creating commodity(%s, %s, %s, %s, %s, %s)' % (session.book, type(name), ns, ticker, uid, 10000)
+  c = GncCommodity(session.book, name.encode(), uidtype.encode(), uid.encode(), uid.encode(), 10000)
   c.set_quote_flag(True)
   c.set_quote_source(gnc_quote_source_lookup_by_internal("yahoo"))
   return comtab.insert(c)
 
-def checkCommodityForRename(uid, ticker):
-  global session
+# def checkCommodityForRename(uid, ticker):
+#   global session
 
-  # print "Checking commodity %s for rename, ticker %s" % (uid, ticker)
-  comtab = session.book.get_table()
+#   # print "Checking commodity %s for rename, ticker %s" % (uid, ticker)
+#   comtab = session.book.get_table()
 
-  for c in getAllCommodities():
-    if c.get_cusip() == uid:
-      # print "Found same cusip, mnemonic=%s" % (c.get_mnemonic())
-      if ticker != c.get_mnemonic():
-        print "Commodity %s renamed to %s" % (c.get_mnemonic(), ticker)
-        c.old_mnemonic = c.get_mnemonic()
-        comtab.remove(c)
-        c.set_mnemonic(ticker)
-        comtab.insert(c)
-      return c
-  return None
+#   for c in getAllCommodities():
+#     if c.get_cusip() == uid:
+#       # print "Found same cusip, mnemonic=%s" % (c.get_mnemonic())
+#       if ticker != c.get_mnemonic():
+#         print "Commodity %s renamed to %s" % (c.get_mnemonic(), ticker)
+#         c.old_mnemonic = c.get_mnemonic()
+#         comtab.remove(c)
+#         c.set_mnemonic(ticker)
+#         comtab.insert(c)
+#       return c
+#   return None
 
 def getSecListEntry(secId):
   """Return security description from SECLIST based on security id"""
@@ -965,9 +953,6 @@ def getAccountForSecId(secId):
   else: secns = 'AMEX'
 
   comm = getCommodityForSecId(secId)
-  if comm.get_namespace() != secns:
-    raise Exception('GnuCash commodity %s:%s (cusip %s) namespace mistmatch (must be %s)'\
-                    % (comm.get_namespace(), comm.get_mnemonic(), secId.uniqueId, secns))
 
   # print "comm cusip = %s mnemonic=%s secid=%s" % (comm.get_cusip(), comm.get_mnemonic(), secId)
 
@@ -1359,9 +1344,11 @@ def make_transaction(commAcc, otherAccount, shares, price, date, desc, taxExempt
   tran.CommitEdit()
 
   if scrabGains:
-    print "Scrabbing gains"
+    print "Scrubbing gains"
     gainsAccount = findAccountByNameOrDie(getIncomeAccountName("CGSHORT", taxExempt))
-    s1.GetParent().ScrubGains(None)
+    tran = s1.GetParent()
+    tran.BeginEdit()
+    tran.ScrubGains(None)
     splits = commAcc.GetSplitList()
     for s in splits:
       other = s.GetOtherSplit()
@@ -1372,6 +1359,8 @@ def make_transaction(commAcc, otherAccount, shares, price, date, desc, taxExempt
       print "Split %s" % (getAccountPath(acc))
       if acc.GetName().find('Orphaned Gains-') == 0:
         other.SetAccount(findAccountByNameOrDie(getIncomeAccountName("CGSHORT", taxExempt)))
+    tran.CommitEdit()
+
 
 def make_transaction2(firstAcc, otherAccount, tranType, amount, date, desc, transId = None):
   """Create two ends of a regular (not stock or mutual fund) account
@@ -1660,6 +1649,7 @@ def updateTransactionList():
       amount = tran.total
       if isinstance(tran, MarginInterestTransaction):
         otherAccountName = commissions_account
+        otherAccType = 'MISC'
       else:
         secId = tran.securityId
         if isinstance(tran, IncomeTransaction):
@@ -1887,6 +1877,7 @@ def doMain(gnuCashFileName, ofxFileName, dontSave, adjust_positions):
   soup = BeautifulSoup(open(ofxFileName))
   url = "xml://"+gnuCashFileName
   session = Session(url, True, False, False)
+  
   brokeragesRoot = findAccountByNameOrDie(brokerage_account_root)
 
   ofx = Ofx(soup);
