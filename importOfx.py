@@ -1346,9 +1346,10 @@ def make_transaction(commAcc, otherAccount, shares, price, date, desc, taxExempt
   if scrabGains:
     print "Scrubbing gains"
     gainsAccount = findAccountByNameOrDie(getIncomeAccountName("CGSHORT", taxExempt))
-    tran = s1.GetParent()
+    # tran = s1.GetParent()
     tran.BeginEdit()
     tran.ScrubGains(None)
+    tran.CommitEdit()
     splits = commAcc.GetSplitList()
     for s in splits:
       other = s.GetOtherSplit()
@@ -1357,9 +1358,23 @@ def make_transaction(commAcc, otherAccount, shares, price, date, desc, taxExempt
         continue
       acc = other.GetAccount()
       print "Split %s" % (getAccountPath(acc))
+
       if acc.GetName().find('Orphaned Gains-') == 0:
-        other.SetAccount(findAccountByNameOrDie(getIncomeAccountName("CGSHORT", taxExempt)))
-    tran.CommitEdit()
+        v1 = s.GetValue()
+        v2 = other.GetValue()
+
+        oldTran = s.GetParent()
+
+        tran.BeginEdit()
+        oldTran.BeginEdit()
+
+        s.SetParent(tran)
+        other.SetParent(tran)
+
+        other.SetAccount(gainsAccount)
+
+        tran.CommitEdit()
+        oldTran.CommitEdit()
 
 
 def make_transaction2(firstAcc, otherAccount, tranType, amount, date, desc, transId = None):
@@ -1648,7 +1663,7 @@ def updateTransactionList():
       subAccount = tran.subAccountFund or tran.subAccountSec or 'CASH'
       amount = tran.total
       if isinstance(tran, MarginInterestTransaction):
-        otherAccountName = commissions_account
+        # otherAccountName = commissions_account
         otherAccType = 'MISC'
       else:
         secId = tran.securityId
@@ -1749,14 +1764,9 @@ def updateTransactionList():
       make_transaction(
         commAcc, getSubAccount(subAccount),
         units, unitPrice,
-        tradeDate, memo, taxExempt, transId)
-      # account for commission and fees
-      if commission + fees != Decimal('0.0'):
-        make_transaction2(findAccountByNameOrDie(commissions_account),
-                          getSubAccount(subAccount),
-                          'CREDIT',
-                          commission + fees,
-                          tradeDate, memo, transId)
+        tradeDate, memo, taxExempt, transId,
+        commissions = commissions + fees,
+        commissionsAccount = findAccountByNameOrDie(commissions_account))
     elif isinstance(tran, TransferTransaction):
       invTran = tran.invTran
       investment = tran
