@@ -881,32 +881,44 @@ def findOrCreateCommodity(uid, uidtype, ns, ticker, name):
   global session
 
   comtab = session.book.get_table()
-  c = comtab.lookup_unique(uidtype + "::" + uid)
-  if c.get_instance() is not None:
+
+  for c in getAllCommodities():
+    if c.get_cusip() == uid:
+      if ticker != c.get_mnemonic():
+        comm = checkCommodityForRename(uid, ticker)
+        if comm is not None:
+          global securityIdToCommodityMap
+          key = uidtype + ':' + uid
+          securityIdToCommodityMap[key] = comm
+          # print "Changed hash on renamed commodity %s => %s, %s" % (secId, comm.get_instance(),
+          #                                                           hasattr(comm, 'old_mnemonic'))
+          return comm
+        raise Exception("Found commodity cusip %s with mnemonic %s not matching %s" %
+                        (uid, c.get_mnemonic(), ticker))
       return c
-  print 'Creating commodity(%s, %s, %s, %s, %s, %s)' % (session.book, type(name), ns, ticker, uid, 10000)
-  c = GncCommodity(session.book, name.encode(), uidtype.encode(), uid.encode(), uid.encode(), 10000)
+  # print 'Creating commodity(%s, %s, %s, %s, %s, %s)' % (session.book, type(name), ns, ticker, uid, 10000)
+  c = GncCommodity(session.book, name.encode(), ns.encode(), ticker.encode(), uid.encode(), 10000)
   c.set_quote_flag(True)
   c.set_quote_source(gnc_quote_source_lookup_by_internal("yahoo"))
   return comtab.insert(c)
 
-# def checkCommodityForRename(uid, ticker):
-#   global session
+def checkCommodityForRename(uid, ticker):
+  global session
 
-#   # print "Checking commodity %s for rename, ticker %s" % (uid, ticker)
-#   comtab = session.book.get_table()
+  # print "Checking commodity %s for rename, ticker %s" % (uid, ticker)
+  comtab = session.book.get_table()
 
-#   for c in getAllCommodities():
-#     if c.get_cusip() == uid:
-#       # print "Found same cusip, mnemonic=%s" % (c.get_mnemonic())
-#       if ticker != c.get_mnemonic():
-#         print "Commodity %s renamed to %s" % (c.get_mnemonic(), ticker)
-#         c.old_mnemonic = c.get_mnemonic()
-#         comtab.remove(c)
-#         c.set_mnemonic(ticker)
-#         comtab.insert(c)
-#       return c
-#   return None
+  for c in getAllCommodities():
+    if c.get_cusip() == uid:
+      # print "Found same cusip, mnemonic=%s" % (c.get_mnemonic())
+      if ticker != c.get_mnemonic():
+        print "Commodity %s renamed to %s" % (c.get_mnemonic(), ticker)
+        c.old_mnemonic = c.get_mnemonic()
+        comtab.remove(c)
+        c.set_mnemonic(ticker)
+        comtab.insert(c)
+      return c
+  return None
 
 def getSecListEntry(secId):
   """Return security description from SECLIST based on security id"""
@@ -990,7 +1002,7 @@ def getAccountForSecId(secId):
   commAcc = parent.lookup_by_code(key)
   if commAcc.get_instance() is None:
     # print "Account by code %s not found, trying name %s" % (key, comm.get_mnemonic())
-    commAcc = parent.lookup_by_name(comm.get_mnemonic())
+    commAcc = parent.lookup_by_name(info.ticker)
     if commAcc.get_instance() is not None:
       # print "Found account by name, code %s commodity %s" % (commAcc.GetCode(),
       #                                                        commAcc.GetCommodity().get_cusip())
@@ -1003,7 +1015,7 @@ def getAccountForSecId(secId):
 
   if commAcc.get_instance() is None:
     if auto_create_commodity_accounts:
-      commAcc = makeCommodityAccount(session.book, parent, comm, acct_type)
+      commAcc = makeCommodityAccount(session.book, parent, info, comm, acct_type)
     else:
       raise Exception('Account for commodity %s does not exist under %s' \
                       % (comm.get_unique_name(), getAccountPath(parent)))
@@ -1017,6 +1029,8 @@ def getAccountForSecId(secId):
     if commAcc.GetCode() != '':
       print "Changing account code from %s to %s" % (commAcc.GetCode(), key)
     commAcc.SetCode(key)
+  if commAcc.GetDescription() != info.securityName:
+    commAcc.SetDescription(info.securityName)
   # Fix it up so that account has lots
   # splits = commAcc.GetSplitList()
   # if len(splits) > 0:
@@ -1058,9 +1072,9 @@ def findOrMakeAccount(account_tuple, root_account, book,
       else:
         return None
 
-def makeCommodityAccount(book, parent, comm, acct_type ):
+def makeCommodityAccount(book, parent, secInfo, comm, acct_type ):
   acc = Account(book)
-  acc.SetName(comm.get_mnemonic())
+  acc.SetName(secInfo.ticker)
   acc.SetCommodity(comm)
   acc.SetType(acct_type)
   parent.append_child(acc)
@@ -1304,17 +1318,12 @@ def updateCommodityPrices():
 
 def make_transaction(commAcc, otherAccount, shares, price, date, desc, taxExempt = False,
                      transId = None,
-                     scrabGains = True):
+                     scrabGains = True,
+                     commissions = Decimal('0'),
+                     commissionsAccount = None):
   """Create two ends of a stock or mutual fund transaction. otherAccount
   must be a bank or other cash account.. otherAccount can be None then
   transaction will be unbalanced.
-
-  Parameters:
-
-  commAcc, otherAccount -> GnuCash accounts
-  shares, price         -> Python Decimal objects
-  date                  -> Python datetime
-  desc                  -> description
 
   """
   global session, brokerAccount
@@ -1340,6 +1349,17 @@ def make_transaction(commAcc, otherAccount, shares, price, date, desc, taxExempt
     s2.SetParent(tran)
     s2.SetAccount(otherAccount)
     s2.SetValue(s1.GetValue().neg())
+
+    if commissions != ZERO and commissionsAccount is not None:
+      s3 = Split(session.book)
+      s3.SetParent(tran)
+      s3.SetAccount(commissionsAccount)
+      s3.SetValue(gnc_numeric_from_decimal(commissions))
+
+      s4 = Split(session.book)
+      s4.SetParent(tran)
+      s4.SetAccount(otherAccount)
+      s4.SetValue(s3.GetValue().neg())
 
   tran.CommitEdit()
 
@@ -1765,7 +1785,7 @@ def updateTransactionList():
         commAcc, getSubAccount(subAccount),
         units, unitPrice,
         tradeDate, memo, taxExempt, transId,
-        commissions = commissions + fees,
+        commissions = commission + fees,
         commissionsAccount = findAccountByNameOrDie(commissions_account))
     elif isinstance(tran, TransferTransaction):
       invTran = tran.invTran
