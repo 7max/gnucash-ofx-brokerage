@@ -17,6 +17,16 @@ from math import log10
 
 ZERO = Decimal(0)
 
+class flushfile(object):
+  def __init__(self, f):
+    self.f = f
+  def write(self, x):
+    self.f.write(x)
+    self.f.flush()
+    
+import sys
+sys.stdout = flushfile(sys.stdout)
+
 def gnc_numeric_to_python_Decimal(numeric):
     negative = numeric.negative_p()
     if negative:
@@ -819,7 +829,8 @@ def findAccountByNameList(root, namelist):
   if len(namelist) == 0:
     return root
   child=root.lookup_by_name(namelist.pop(0))
-  if child.get_instance() is not None:
+  if child.get_instance() is not None and \
+     child.get_parent().get_instance() == root.get_instance():
     return findAccountByNameList(child, namelist)
 
 def findAccountByNameString(name_string):
@@ -890,7 +901,7 @@ def findOrCreateCommodity(uid, uidtype, ns, ticker, name):
           global securityIdToCommodityMap
           key = uidtype + ':' + uid
           securityIdToCommodityMap[key] = comm
-          # print "Changed hash on renamed commodity %s => %s, %s" % (secId, comm.get_instance(),
+          # print "Changed hash on renamed commodity %s => %s, %s" % (uid, comm.get_instance(),
           #                                                           hasattr(comm, 'old_mnemonic'))
           return comm
         raise Exception("Found commodity cusip %s with mnemonic %s not matching %s" %
@@ -1052,7 +1063,8 @@ def findOrMakeAccount(account_tuple, root_account, book,
                          currency, acct_type ):
     current_account_name, account_path = account_tuple[0], account_tuple[1:]
     current_account = root_account.lookup_by_name(current_account_name)
-    if current_account.get_instance() == None:
+    if current_account.get_instance() is None \
+       or current_account.get_parent().get_instance() != root_account.get_instance():
       current_account = Account(book)
       current_account.SetName(current_account_name)
       current_account.SetCommodity(currency)
@@ -1364,7 +1376,7 @@ def make_transaction(commAcc, otherAccount, shares, price, date, desc, taxExempt
   tran.CommitEdit()
 
   if scrabGains:
-    print "Scrubbing gains"
+    # print "Scrubbing gains"
     gainsAccount = findAccountByNameOrDie(getIncomeAccountName("CGSHORT", taxExempt))
     # tran = s1.GetParent()
     tran.BeginEdit()
@@ -1373,11 +1385,11 @@ def make_transaction(commAcc, otherAccount, shares, price, date, desc, taxExempt
     splits = commAcc.GetSplitList()
     for s in splits:
       other = s.GetOtherSplit()
-      print "Processing split=%s other=%s" % (s, other)
+      # print "Processing split=%s other=%s" % (s, other)
       if other.get_instance() is None:
         continue
       acc = other.GetAccount()
-      print "Split %s" % (getAccountPath(acc))
+      # print "Split %s" % (getAccountPath(acc))
 
       if acc.GetName().find('Orphaned Gains-') == 0:
         v1 = s.GetValue()
@@ -1397,7 +1409,9 @@ def make_transaction(commAcc, otherAccount, shares, price, date, desc, taxExempt
         oldTran.CommitEdit()
 
 
-def make_transaction2(firstAcc, otherAccount, tranType, amount, date, desc, transId = None):
+def make_transaction2(firstAcc, otherAccount, tranType, amount, date, desc,
+                      transId = None,
+                      commAcc = None):
   """Create two ends of a regular (not stock or mutual fund) account
   transaction.
 
@@ -1412,6 +1426,12 @@ def make_transaction2(firstAcc, otherAccount, tranType, amount, date, desc, tran
   amount                -> python decimal
   date                  -> Python datetime
   desc                  -> description
+  commAcc               -> commodity account to show income coming from
+
+    When specified, income from a security (ie dividends or distribution)
+    is routed through this account before going into the target account, this
+    allows Advanced Portfolio report to pickup up gains/dividends as part of
+    the total for security
 
   """
   global session, brokerAccount
@@ -1438,8 +1458,24 @@ def make_transaction2(firstAcc, otherAccount, tranType, amount, date, desc, tran
   if otherAccount is not None:
     s2 = Split(session.book)
     s2.SetParent(tran)
-    s2.SetAccount(otherAccount)
     s2.SetValue(s1.GetValue().neg())
+    if commAcc is None:
+      s2.SetAccount(otherAccount)
+    else:
+      # income is coming from the commodity account
+      s2.SetAccount(commAcc)
+
+      # now show income arriving in commodity account 
+      s3 = Split(session.book)
+      s3.SetParent(tran)
+      s3.SetValue(gnc_numeric_from_decimal(amount));
+      s3.SetAccount(commAcc)
+
+      # from the income account
+      s4 = Split(session.book)
+      s4.SetParent(tran)
+      s4.SetValue(s3.GetValue().neg())
+      s4.SetAccount(otherAccount)
 
   tran.CommitEdit()
   return s1
@@ -1447,6 +1483,7 @@ def make_transaction2(firstAcc, otherAccount, tranType, amount, date, desc, tran
 def getIncomeAccountName(incomeType, taxExempt):
   "Return full GnuCash account name for where income should go."
   name = income_account_root
+  assert not taxExempt
   if taxExempt: income = income_account_tax_exempt_root
   name += ':'
   if incomeType == 'CGLONG': name += income_type_accounts[0]
@@ -1596,6 +1633,11 @@ def isOppositeTransferTransaction(acc1, tran1, tran2):
   cusip1 = comm1.get_cusip()
   cusip2 = comm2.get_cusip()
 
+  if mnem1[-4:] == '.OLD':
+    mnem1 = mnem1[:-4]
+  if mnem2[-4:] == '.OLD':
+    mnem2 = mnem2[:-4]
+
   # ok if either ticker or cusip is unchanged, then consider it a rename
   if mnem1 != mnem2 and cusip1 != cusip2:
     # print "Here7 mnem1=%s mnem2=%s cusip1=%s cusip2=%s" % (mnem1,
@@ -1616,6 +1658,27 @@ def isOppositeTransferTransaction(acc1, tran1, tran2):
     # print "here9 bal1 = %s tran1.units = %s bal2 = %s " \
     # % (bal1, tran1.units, bal2)
     return False
+
+
+def findCompatiblePosition(transfer):
+  """Find the position in position list for the stock matching this transfer
+  with same date and number of units"""
+  global ofx
+
+  poslist = ofx.stmtResponse.positions
+  for pos in poslist:
+    investment = pos.investment
+    secId = investment.securityId
+    date = investment.marketValueDate
+
+    if transfer.securityId.uniqueIdType == secId.uniqueIdType \
+       and transfer.securityId.uniqueId == secId.uniqueId \
+       and investment.type == 'LONG' \
+       and investment.units == transfer.units \
+       and transfer.invTran.tradeDate == date:
+      return pos
+  return None
+
 
 def updateTransactionList():
   """Copy the banking and investment transactions from OFX file """
@@ -1682,11 +1745,13 @@ def updateTransactionList():
       invTran = tran.invTran
       subAccount = tran.subAccountFund or tran.subAccountSec or 'CASH'
       amount = tran.total
+      commAcc = None
       if isinstance(tran, MarginInterestTransaction):
         # otherAccountName = commissions_account
         otherAccType = 'MISC'
       else:
         secId = tran.securityId
+        commAcc = getAccountForSecId(secId)
         if isinstance(tran, IncomeTransaction):
           taxExempt = tran.taxExempt
           otherAccType = tran.incomeType
@@ -1706,12 +1771,11 @@ def updateTransactionList():
         #print "Found suspected duplicate %s skipping" % (tran)
         continue
 
-      print "NEW transaction %s" % (tran)
-      make_transaction2(subAccount,
-                        findAccountByNameOrDie(otherAccountName), 
-                        'CREDIT',
-                        amount,
-                        tradeDate, memo, transId)
+      otherAccount = findAccountByNameOrDie(otherAccountName)
+      print "NEW transaction %s otherAccountName=%s otherAccount=%s" \
+      % (tran, otherAccountName, getAccountPath(otherAccount))
+      make_transaction2(subAccount, otherAccount, 
+                        'CREDIT', amount, tradeDate, memo, transId, commAcc = commAcc )
     elif isinstance(tran, BuyMFTransaction) \
     or isinstance(tran, SellMFTransaction) \
     or isinstance(tran, BuyOptionTransaction) \
@@ -1794,6 +1858,7 @@ def updateTransactionList():
       units = investment.units
       unitPrice = investment.unitPrice or Decimal('0.0')
       tranType = 'Transfer ' + tran.transferAction
+      taxExempt = False
 
       transId = invTran.transactionId
       subAccount = investment.subAccountSec or 'CASH'
@@ -1802,6 +1867,7 @@ def updateTransactionList():
       sec = getSecListEntry(secId)
       commAcc = getAccountForSecId(secId)
       comm = getCommodityForSecId(secId)
+      otherAccount = getSubAccount(subAccount)
 
       # if memo line is empty, make a memory line
       if memo is None or memo == '':
@@ -1836,6 +1902,29 @@ def updateTransactionList():
         print "Found suspected duplicate %s %s skipping" % (tran.__class__.__name__, tran)
         continue
 
+      # see if its a dividend reinvestment
+      if memo.lower().find('dividend') >= 0 or memo.lower().find('reinvest') >= 0 \
+         and tran.transferAction == 'IN' \
+         and tran.type == 'LONG':
+        print "Seems to be TRANSFER for dividend reinvestment"
+        # IB does not show the price, figure it out from position
+        if unitPrice == 0.0:
+          print "Price is zero, trying to find price in position list"
+          pos = findCompatiblePosition(tran)
+          if pos == None:
+            raise Exception("Unable to find position matching dividend transfer, needed to determine basis")
+          unitPrice = pos.investment.unitPrice
+        otherAccount = findAccountByNameOrDie(getIncomeAccountName("DIV", taxExempt))
+
+        make_transaction(
+          commAcc, otherAccount,
+          units, unitPrice,
+          tradeDate, memo, taxExempt, transId,
+          scrabGains = doScrab )
+        continue
+
+      # See if its CUSIP change
+
       acc2 = None
       tran2list = [tran2 for tran2 in ofx.stmtResponse.transactions.investmentTransactions
                    if tran2 != tran and isOppositeTransferTransaction(commAcc, tran, tran2) ]
@@ -1866,36 +1955,55 @@ def updateTransactionList():
         bal1 = gnc_numeric_to_python_Decimal(acc1.GetBalance()) 
         bal2 = gnc_numeric_to_python_Decimal(acc2.GetBalance())
 
-        print "Here bal1=%s bal2=%s tran.units=%s" % (bal1, bal2, tran.units)
+        # print "ere bal1=%s bal2=%s tran.units=%s" % (bal1, bal2, tran.units)
         assert tran.transferAction == "IN"
         assert bal1 == 0
         assert bal2 == tran.units
 
-        # now rename the accounts
+        # Now rename the accounts making old account have new name,
+        # and via versa. This is simpler then moving all transactions and
+        # lots from old to new accounts
         key1 = secId.uniqueIdType + ':' + secId.uniqueId
         key2 = tran2.securityId.uniqueIdType + ':' + tran2.securityId.uniqueId
         
+        desc1 = acc1.GetDescription()
+        desc2 = acc2.GetDescription()
+        name1 = acc1.GetName()
+        name2 = acc2.GetName()
+
         acc2.SetCommodity(comm1)
         acc2.SetCode(key1)
+        acc2.SetDescription(desc1)
+        acc2.SetName(comm1.get_mnemonic())
         acc1.SetCommodity(comm2)
         acc1.SetCode(key2)
+        acc1.SetDescription(desc2)
+        acc1.SetName(comm2.get_mnemonic())
 
         global securityIdToAccountMap
 
         securityIdToAccountMap[key1] = acc2
         securityIdToAccountMap[key2] = acc1
 
+        matched.append(tran2)
         print "NEW internal transfer transaction %s" % (tran)
+        # make two empty transactions, so that next time we import
+        # both IN/OUT are detected as duplicate
         make_transaction(
-          commAcc, getSubAccount(subAccount),
+          acc1, acc2,
           Decimal('0'), Decimal('0'),
           tradeDate, memo, taxExempt, transId,
           scrabGains = False )
-
+        make_transaction(
+          acc2, acc1,
+          Decimal('0'), Decimal('0'),
+          tran2.invTran.tradeDate, tran2.invTran.memo, taxExempt,
+          tran2.invTran.transactionId,
+          scrabGains = False )
       else:
         print "NEW transfer transaction %s doScrab=%s" % (tran, doScrab)
         make_transaction(
-          commAcc, getSubAccount(subAccount),
+          commAcc, otherAccount,
           units, unitPrice,
           tradeDate, memo, taxExempt, transId,
           scrabGains = doScrab )
@@ -1913,7 +2021,7 @@ def doMain(gnuCashFileName, ofxFileName, dontSave, adjust_positions):
   ofx = Ofx(soup);
 
   findBrokerAndCashAccount()
-  #handleRenamedCommodities()
+  handleRenamedCommodities()
   updateTransactionList()
   # Now do final adjustments to balances as per OFX file
   createPositionAdjustments(adjust_positions)
@@ -1923,8 +2031,8 @@ def doMain(gnuCashFileName, ofxFileName, dontSave, adjust_positions):
   else: print "Gnucash file was not saved (dry run)"
 
 
-dbg_gcfile='/home/max/Documents/Finances/test2.gnucash'
-dbg_ofxfile='/home/max/Documents/Finances/viv.ofx'
+dbg_gcfile='/home/max/gnucash2/am2.gnucash'
+dbg_ofxfile='/home/max/gnucash2/ameritrade20110831.ofx'
 
 
 def main():
