@@ -23,9 +23,11 @@ class flushfile(object):
   def write(self, x):
     self.f.write(x)
     self.f.flush()
-    
+  
 import sys
-sys.stdout = flushfile(sys.stdout)
+# for some reason isinstance does not work
+if str(sys.stdout).find('flushfile') == -1:
+  sys.stdout = flushfile(sys.stdout)
 
 def gnc_numeric_to_python_Decimal(numeric):
     negative = numeric.negative_p()
@@ -112,14 +114,20 @@ income_account_tax_exempt_root = 'Income:Tax Exempt'
 # income_account_root, or under income_account_tax_exempt_root if
 # tax_exempt_flag is set
 # 
-# 1. long term cap gains
+# 1. Long term cap gains
 # 2. Short Term cap gains
 # 3. Dividend Income
 # 4. Interest Income
-# 5. All other income
+# 5. Futures profit/loss
+# 6. Assigned option premium
+# when stock is bought due to option being assigned.. When
+# we see option removed due to stock assignemnt, we put income
+# into this account, and later we need to find the stock,
+# and adjust buy or sell price by the price of the option that was written
+# 
 income_type_accounts = ('Long Term Capital Gains', 'Short Term Capital Gains',
                         'Dividend Income', 'Interest Income', 'Misc Income',
-                        'Futures P&L')
+                        'Futures P&L', 'Assigned Option Premium')
 
 # When OFX file has a position in some stock or mutual fund and after
 # processing and inserting buy/sell transactions GnuCash position does
@@ -846,6 +854,20 @@ def findAccountByNameOrDie(accountName):
     raise Exception("Unable to find '%s' account" % (accountName))
   return ret
     
+def findOrCreateIncomeAccount(root_name, commAcc):
+  "Find root_name account, then find or create sub-account under it named after commAcc"
+  root = findAccountByNameOrDie(root_name)
+  if commAcc is None:
+    return root
+  else:
+    name = extractSymbolName(commAcc.GetCommodity())
+    acc = findOrMakeAccount((name,), root,
+                            session.book,
+                            root.GetCommodity(),
+                            root.GetType())
+    if acc.GetDescription() == '':
+      acc.SetDescription(commAcc.GetDescription())
+    return acc
 ###
 ### Global variables
 ### 
@@ -1332,7 +1354,8 @@ def make_transaction(commAcc, otherAccount, shares, price, date, desc, taxExempt
                      transId = None,
                      scrabGains = True,
                      commissions = Decimal('0'),
-                     commissionsAccount = None):
+                     commissionsAccount = None,
+                     isOptionAssignemnt = False):
   """Create two ends of a stock or mutual fund transaction. otherAccount
   must be a bank or other cash account.. otherAccount can be None then
   transaction will be unbalanced.
@@ -1377,11 +1400,22 @@ def make_transaction(commAcc, otherAccount, shares, price, date, desc, taxExempt
 
   if scrabGains:
     # print "Scrubbing gains"
-    gainsAccount = findAccountByNameOrDie(getIncomeAccountName("CGSHORT", taxExempt))
     # tran = s1.GetParent()
+    if len(commAcc.GetLotList()) == 0:
+      splits = commAcc.GetSplitList()
+      if len(splits) > 0:
+        print "Found account with splits, but no lot, will scrub each transaction"
+        for s in commAcc.GetSplitList():
+          tran2 = s.GetParent()
+          tran2.BeginEdit()
+          tran2.ScrubGains(None)
+          tran2.CommitEdit()
+
     tran.BeginEdit()
     tran.ScrubGains(None)
     tran.CommitEdit()
+    # TODO, get list of split by getting LOT of transaction we just created, then
+    # obtaining list of splits from the lot, and finding the orphaned gains there
     splits = commAcc.GetSplitList()
     for s in splits:
       other = s.GetOtherSplit()
@@ -1392,6 +1426,21 @@ def make_transaction(commAcc, otherAccount, shares, price, date, desc, taxExempt
       # print "Split %s" % (getAccountPath(acc))
 
       if acc.GetName().find('Orphaned Gains-') == 0:
+        lot = GncLot(instance = s.GetLot())
+        lotOpenDate = datetime.fromtimestamp(lot.get_earliest_split().GetParent().GetDate())
+        gainDate = datetime.fromtimestamp(other.GetParent().GetDate())
+        lotOpenDatePlusOneYear = lotOpenDate.replace(year = lotOpenDate.year + 1)
+        isLongTerm = gainDate > lotOpenDatePlusOneYear
+
+        if isOptionAssignemnt: gainsAccName = "ASSIGN"
+        elif isLongTerm: gainsAccName = "CGLONG"
+        else: gainsAccName = "CGSHORT"
+
+        # print "lotOpenDate=%s gainDate=%s lotOpenDatePlusOneYear=%s isLongTerm=%s gainsAccName=%s" % (lotOpenDate, gainDate, lotOpenDatePlusOneYear, isLongTerm, gainsAccName)
+
+        gainsAccount = findOrCreateIncomeAccount(getIncomeAccountName(gainsAccName,
+                                                                      taxExempt), commAcc)
+
         v1 = s.GetValue()
         v2 = other.GetValue()
 
@@ -1480,6 +1529,16 @@ def make_transaction2(firstAcc, otherAccount, tranType, amount, date, desc,
   tran.CommitEdit()
   return s1
 
+def extractSymbolName(commodity):
+  "Extract probable underlaying symbol name from maybe option name"
+
+  name = commodity.get_mnemonic() + " " + commodity.get_fullname()
+  match = re.search('(?i)\((\S+) .*(Put|Call)\)', name) \
+          or re.match('(?i)^([A-Z.]+).*', name)
+  if match is not None:
+    return match.groups()[0]
+  return name
+
 def getIncomeAccountName(incomeType, taxExempt):
   "Return full GnuCash account name for where income should go."
   name = income_account_root
@@ -1492,6 +1551,7 @@ def getIncomeAccountName(incomeType, taxExempt):
   elif incomeType == 'INTEREST': name += income_type_accounts[3]
   elif incomeType == 'MISC': name += income_type_accounts[4]
   elif incomeType == 'FUTURE': name += income_type_accounts[5]
+  elif incomeType == 'ASSIGN': name += income_type_accounts[6]
   else:
     print "Warning: unknown OFX income type %s" % (incomeType)
     name += income_type_accounts[4]
@@ -1511,7 +1571,7 @@ def findIfDuplicate(account, date, amount, memo, transId):
   for split in account.GetSplitList():
     trans = split.parent
 
-    transDate = date.fromtimestamp(trans.GetDate())
+    transDate = datetime.fromtimestamp(trans.GetDate())
     transAmount = gnc_numeric_to_python_Decimal(split.GetValue()).quantize(Decimal('1.00'))
     transNote = trans.GetNotes()
     transMemo = trans.GetDescription()
@@ -1771,7 +1831,7 @@ def updateTransactionList():
         #print "Found suspected duplicate %s skipping" % (tran)
         continue
 
-      otherAccount = findAccountByNameOrDie(otherAccountName)
+      otherAccount = findOrCreateIncomeAccount(otherAccountName, commAcc)
       print "NEW transaction %s otherAccountName=%s otherAccount=%s" \
       % (tran, otherAccountName, getAccountPath(otherAccount))
       make_transaction2(subAccount, otherAccount, 
@@ -1914,7 +1974,8 @@ def updateTransactionList():
           if pos == None:
             raise Exception("Unable to find position matching dividend transfer, needed to determine basis")
           unitPrice = pos.investment.unitPrice
-        otherAccount = findAccountByNameOrDie(getIncomeAccountName("DIV", taxExempt))
+        otherAccount = findOrCreateIncomeAccount(getIncomeAccountName("DIV", taxExempt),
+                                                 commAcc)
 
         make_transaction(
           commAcc, otherAccount,
@@ -2000,13 +2061,18 @@ def updateTransactionList():
           tran2.invTran.tradeDate, tran2.invTran.memo, taxExempt,
           tran2.invTran.transactionId,
           scrabGains = False )
+        continue
       else:
         print "NEW transfer transaction %s doScrab=%s" % (tran, doScrab)
+        isOptionAssignemnt = False
+        # if isinstance(sec, OptionSecurityInfo) and memo.lower().find('assign'):
+        #   isOptionAssignemnt = True
         make_transaction(
           commAcc, otherAccount,
           units, unitPrice,
           tradeDate, memo, taxExempt, transId,
-          scrabGains = doScrab )
+          scrabGains = doScrab,
+          isOptionAssignemnt = isOptionAssignemnt)
 
 
 def doMain(gnuCashFileName, ofxFileName, dontSave, adjust_positions):
@@ -2031,7 +2097,7 @@ def doMain(gnuCashFileName, ofxFileName, dontSave, adjust_positions):
   else: print "Gnucash file was not saved (dry run)"
 
 
-dbg_gcfile='/home/max/gnucash2/am2.gnucash'
+dbg_gcfile='/home/max/gnucash2/am3.gnucash'
 dbg_ofxfile='/home/max/gnucash2/ameritrade20110831.ofx'
 
 
