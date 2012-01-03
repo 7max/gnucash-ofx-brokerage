@@ -104,8 +104,13 @@ brokerage_account_stocks = 'Stocks';
 brokerage_account_mutual_funds = 'Mutual Funds'
 brokerage_account_bonds = 'Bonds'
 brokerage_account_options = 'Options'
-# Account for broker commissions and fees
+# If True then Income and Expanse root accounts will be created under
+# the brokerage account, and not under root
+income_and_expanse_under_brokerage = True
+# Root Account for broker commissions and fees
 commissions_account = 'Expenses:Commissions'
+fees_account = 'Expenses:Broker Fees'
+interest_expense_account = 'Expenses:Margin Interest'
 # Income account roots. We have a separate sub-tree for
 # income with tax-exempt flag set.
 income_account_root = 'Income'
@@ -127,7 +132,7 @@ income_account_tax_exempt_root = 'Income:Tax Exempt'
 # 
 income_type_accounts = ('Long Term Capital Gains', 'Short Term Capital Gains',
                         'Dividend Income', 'Interest Income', 'Misc Income',
-                        'Futures P&L', 'Assigned Option Premium')
+                        'Futures P&L', 'Lieu DIV')
 
 # When OFX file has a position in some stock or mutual fund and after
 # processing and inserting buy/sell transactions GnuCash position does
@@ -637,7 +642,7 @@ makeOfxClass('DebtSecurityInfo',
              # "SMALLSTOCK", "INTLSTOCK", "MONEYMARKET", "OTHER", optional
              ('assetClass', str, False, 'assetclass'))
 
-DebtSecurityInfo.commodityNamespace = 'AMEX'
+# DebtSecurityInfo.commodityNamespace = 'AMEX'
 
 # mfinfo
 makeOfxClass('MutualFundSecurityInfo',
@@ -674,7 +679,7 @@ makeOfxClass('OptionSecurityInfo',
              # an optional field according to the OFX spec.
              ('underlyingSecurity', 'SecurityId', False, 'secid'))
 
-OptionSecurityInfo.commodityNamespace = 'AMEX'
+# OptionSecurityInfo.commodityNamespace = 'AMEX'
 
 
 # otherinfo
@@ -690,7 +695,7 @@ makeOfxClass('OtherSecurityInfo',
              # optional field according to the OFX spec.
              ('fiAssetClass', str, False, 'fiassetclass'))
 
-OtherSecurityInfo.commodityNamespace = 'AMEX'
+# OtherSecurityInfo.commodityNamespace = 'AMEX'
 
 # stockinfo
 makeOfxClass('StockSecurityInfo',
@@ -714,7 +719,7 @@ makeOfxClass('StockSecurityInfo',
              # an optional field according to the OFX spec.
              ('fiAssetClass', str, False, 'fiassetclass'))
 
-StockSecurityInfo.commodityNamespace = 'AMEX'
+# StockSecurityInfo.commodityNamespace = 'AMEX'
 
 
 def parseSecurityInfo(soup):
@@ -854,7 +859,7 @@ def findAccountByNameOrDie(accountName):
     raise Exception("Unable to find '%s' account" % (accountName))
   return ret
     
-def findOrCreateIncomeAccount(root_name, commAcc):
+def findOrCreateCommodityAccount(root_name, commAcc):
   "Find root_name account, then find or create sub-account under it named after commAcc"
   root = findAccountByNameOrDie(root_name)
   if commAcc is None:
@@ -903,15 +908,16 @@ def getSubAccount(name):
 
 # iterator that gets all commodities in the table
 def getAllCommodities():
-  global session
-  for ns in session.book.get_table().get_namespaces_list():
-    for c in ns.get_commodity_list():
-      yield c
+  global session, brokerAccount
+  comtab = session.book.get_table()
+  ns = comtab.add_namespace(brokerAccount.GetCode(), session.book)
+  for c in ns.get_commodity_list():
+    yield c
 
 # Return GnuCash commodity with specified UID (cusip). If can't find
 # it the commodity, create it first
-def findOrCreateCommodity(uid, uidtype, ns, ticker, name):
-  global session
+def findOrCreateCommodity(uid, uidtype, ticker, name):
+  global session, brokerAccount
 
   comtab = session.book.get_table()
 
@@ -930,7 +936,8 @@ def findOrCreateCommodity(uid, uidtype, ns, ticker, name):
                         (uid, c.get_mnemonic(), ticker))
       return c
   # print 'Creating commodity(%s, %s, %s, %s, %s, %s)' % (session.book, type(name), ns, ticker, uid, 10000)
-  c = GncCommodity(session.book, name.encode(), ns.encode(), ticker.encode(), uid.encode(), 10000)
+  c = GncCommodity(session.book, name.encode(), brokerAccount.GetCode(),
+                   ticker.encode(), uid.encode(), 10000)
   c.set_quote_flag(True)
   c.set_quote_source(gnc_quote_source_lookup_by_internal("yahoo"))
   return comtab.insert(c)
@@ -974,7 +981,6 @@ def getCommodityForSecId(secId):
     security = getSecListEntry(secId)
     info = security.securityInfo
     comm = findOrCreateCommodity(secId.uniqueId, secId.uniqueIdType,
-                                 security.commodityNamespace,
                                  info.ticker, info.securityName) 
     securityIdToCommodityMap[key] = comm
     # print "Created commodity %s => %s, %s" % (secId, comm.get_instance(),
@@ -1074,6 +1080,8 @@ def getAccountForSecId(secId):
 
 def getAccountPath(account):
   """ Return full name of account starting from root """
+  if account is None:
+    return "None"
   if account.get_parent().get_instance() is None:
     return '' #  this is  root
   else:
@@ -1147,7 +1155,9 @@ def findOrCreateBrokerAccount(parent, name, acctId, currency, acctType, searchBy
 # under it we may have separate accounts for Cash
 # and then stocks, bonds, market indexes
 def findBrokerAndCashAccount():
-  global session, brokerAccount, brokerSubAccounts, ofx
+  global session, brokerAccount, brokerSubAccounts, ofx, commissions_account,\
+         income_account_root, income_account_tax_exempt_root, fees_account, \
+         interest_expense_account
   orgName = ofx.signonResponse.orgName
   accFrom = ofx.stmtResponse.investmentAccountFrom
   acctId = accFrom.accountId
@@ -1161,12 +1171,35 @@ def findBrokerAndCashAccount():
   
   cashAccount = getSubAccount("CASH")
 
+  # TODO generalize below code into function
+
+  # prefix the account names with brokerage account path if needed
+  if income_and_expanse_under_brokerage:
+    commissions_account = getAccountPath(brokerAccount) + ":" + commissions_account
+    fees_account = getAccountPath(brokerAccount) + ":" + fees_account
+    interest_expense_account = getAccountPath(brokerAccount) + ":" \
+                               + interest_expense_account
+    income_account_root = getAccountPath(brokerAccount) + ":" + income_account_root
+    income_account_tax_exempt_root = getAccountPath(brokerAccount) + ":" + income_account_tax_exempt_root
+
   if auto_create_income_and_expanse_accounts:
     commissionsAccount = findOrMakeAccount(commissions_account.split(':'),
                                            session.book.get_root_account(),
                                            session.book,
                                            brokerAccount.GetCommodity(),
                                            ACCT_TYPE_EXPENSE)
+
+    feesAccount = findOrMakeAccount(fees_account.split(':'),
+                                    session.book.get_root_account(),
+                                    session.book,
+                                    brokerAccount.GetCommodity(),
+                                    ACCT_TYPE_EXPENSE)
+
+    interestExpenseAccount = findOrMakeAccount(interest_expense_account.split(':'),
+                                               session.book.get_root_account(),
+                                               session.book,
+                                               brokerAccount.GetCommodity(),
+                                               ACCT_TYPE_EXPENSE)
 
     incomeRoot = findOrMakeAccount(income_account_root.split(':'),
                                    session.book.get_root_account(),
@@ -1438,7 +1471,7 @@ def make_transaction(commAcc, otherAccount, shares, price, date, desc, taxExempt
 
         # print "lotOpenDate=%s gainDate=%s lotOpenDatePlusOneYear=%s isLongTerm=%s gainsAccName=%s" % (lotOpenDate, gainDate, lotOpenDatePlusOneYear, isLongTerm, gainsAccName)
 
-        gainsAccount = findOrCreateIncomeAccount(getIncomeAccountName(gainsAccName,
+        gainsAccount = findOrCreateCommodityAccount(getIncomeAccountName(gainsAccName,
                                                                       taxExempt), commAcc)
 
         v1 = s.GetValue()
@@ -1551,7 +1584,7 @@ def getIncomeAccountName(incomeType, taxExempt):
   elif incomeType == 'INTEREST': name += income_type_accounts[3]
   elif incomeType == 'MISC': name += income_type_accounts[4]
   elif incomeType == 'FUTURE': name += income_type_accounts[5]
-  elif incomeType == 'ASSIGN': name += income_type_accounts[6]
+  elif incomeType == 'LIEU': name += income_type_accounts[6]
   else:
     print "Warning: unknown OFX income type %s" % (incomeType)
     name += income_type_accounts[4]
@@ -1575,7 +1608,7 @@ def findIfDuplicate(account, date, amount, memo, transId):
     transAmount = gnc_numeric_to_python_Decimal(split.GetValue()).quantize(Decimal('1.00'))
     transNote = trans.GetNotes()
     transMemo = trans.GetDescription()
-
+    daysApart = abs((transDate - date).days)
     # definitely a dup, because we store transId in user-invisible note
     # note that we match this before matching Units
     #
@@ -1593,7 +1626,8 @@ def findIfDuplicate(account, date, amount, memo, transId):
     # on that. If there are transacitons with same transaction ids,
     # then we are screwed
     if transId is not None and transId != "" \
-       and transNote == transId:
+       and transNote == transId \
+       and daysApart < 5:
       return True
 
     if amount is not None:
@@ -1609,7 +1643,6 @@ def findIfDuplicate(account, date, amount, memo, transId):
         # print 'Units or price dont match'
         continue
 
-    daysApart = abs((transDate - date).days)
     if daysApart > 5:
       # print 'More then 5 days apart'
       continue
@@ -1744,45 +1777,6 @@ def updateTransactionList():
   """Copy the banking and investment transactions from OFX file """
   global session, brokerAccount, ofx
   matched = []
-  for tran in ofx.stmtResponse.transactions.bankTransactions:
-    if tran in matched:
-      continue
-    acc1Type = tran.subAccountFund  # CASH, MARGIN etc
-    acc1 = getSubAccount(acc1Type)  
-    tranType = tran.transaction.type
-    timePosted = tran.transaction.timePosted
-    amount = tran.transaction.amount
-    memo = tran.transaction.memo
-    transId = tran.transaction.transactionId
-
-    # Lets see if its a duplicate
-    if findIfDuplicate(acc1, timePosted, amount, memo, transId):
-      #print "Found suspected duplicate %s:%s skipping" % (tran.subAccountFund, tran.transaction)
-      continue
-
-    # We don't have access to GUI here, so we can't popup GnuCash "find matching accoun"
-    # dialog.. But a lot of brokereges have a matching pair of transactions daily between
-    # CASH and MARGIN accounts
-    #
-    # Try to find the transaction with either same amount and opposite
-    # TRANTYPE (ie 10k debit from MARGIN is matched with 10k credit
-    # into CASH) or a transaciton with same type, but opposite sign
-    # amounts, ie -10k credit to MARGIN and 10k credit to CASH)
-    #
-    # Otherwise transaction will remain unbalanced, and user will have
-    # to balance it manually
-    #
-    acc2 = None
-    tran2list = [tran2 for tran2 in ofx.stmtResponse.transactions.bankTransactions
-                if tran2 != tran and tran2.subAccountFund != tran.subAccountFund
-                and (tran2.transaction.amount == -amount and tran2.transaction.type != tranType)]
-    if len(tran2list) == 1:
-      print "Found match %s:%s for %s:%s" % (
-        tran.subAccountFund, tran.transaction,
-        tran2list[0].subAccountFund, tran2list[0].transaction)
-      acc2 = getSubAccount(tran2list[0].subAccountFund)
-      matched.append(tran2list[0])
-    make_transaction2(acc1, acc2, tranType, amount, timePosted, memo, transId)
 
   #
   # Now update investment transactions
@@ -1803,12 +1797,13 @@ def updateTransactionList():
     if isinstance(tran, MarginInterestTransaction) or isinstance(tran, IncomeTransaction) \
        or isinstance(tran, ExpenseTransaction):
       invTran = tran.invTran
+      memo = invTran.memo
       subAccount = tran.subAccountFund or tran.subAccountSec or 'CASH'
       amount = tran.total
       commAcc = None
       if isinstance(tran, MarginInterestTransaction):
         # otherAccountName = commissions_account
-        otherAccType = 'MISC'
+        otherAccountName = interest_expense_account
       else:
         secId = tran.securityId
         commAcc = getAccountForSecId(secId)
@@ -1818,10 +1813,9 @@ def updateTransactionList():
         else: # its expense
           taxExempt = False
           otherAccType = 'MISC'
-      memo = invTran.memo
-      if memo.find('FUTURE') == 0:
-        otherAccType = 'FUTURE'
-      otherAccountName = getIncomeAccountName(otherAccType, taxExempt)
+        if memo.find('FUTURE') != -1:
+          otherAccType = 'FUTURE'
+        otherAccountName = getIncomeAccountName(otherAccType, taxExempt)
       transId = invTran.transactionId
       tradeDate = invTran.tradeDate
       subAccount = getSubAccount(subAccount)
@@ -1831,7 +1825,7 @@ def updateTransactionList():
         #print "Found suspected duplicate %s skipping" % (tran)
         continue
 
-      otherAccount = findOrCreateIncomeAccount(otherAccountName, commAcc)
+      otherAccount = findOrCreateCommodityAccount(otherAccountName, commAcc)
       print "NEW transaction %s otherAccountName=%s otherAccount=%s" \
       % (tran, otherAccountName, getAccountPath(otherAccount))
       make_transaction2(subAccount, otherAccount, 
@@ -1888,7 +1882,7 @@ def updateTransactionList():
            and memo.lower().find('short') == -1:
         memo = tranType + ' ' + memo
 
-      #print "Processing investment transaction %s" % (transId)
+      print "Processing buy/sell investment transaction %s" % (transId)
 
       # Unfortunately there is no way to specify trade fraction
       # multiplier greater then one commodities, it would have been
@@ -1901,16 +1895,16 @@ def updateTransactionList():
 
       # Lets see if its a duplicate
       if findIfDuplicate(commAcc, tradeDate, (units, unitPrice), memo, transId):
-        #print "Found suspected duplicate %s %s skipping" % (tran.__class__.__name__, tran.investment)
+        print "Found suspected duplicate %s %s skipping" % (tran.__class__.__name__, tran.investment)
         continue
 
-      print "NEW investment transaction %s" % (tran)
+      print "NEW buy/sell investment transaction %s" % (tran)
       make_transaction(
         commAcc, getSubAccount(subAccount),
         units, unitPrice,
         tradeDate, memo, taxExempt, transId,
         commissions = commission + fees,
-        commissionsAccount = findAccountByNameOrDie(commissions_account))
+        commissionsAccount = findOrCreateCommodityAccount(commissions_account, commAcc))
     elif isinstance(tran, TransferTransaction):
       invTran = tran.invTran
       investment = tran
@@ -1974,7 +1968,7 @@ def updateTransactionList():
           if pos == None:
             raise Exception("Unable to find position matching dividend transfer, needed to determine basis")
           unitPrice = pos.investment.unitPrice
-        otherAccount = findOrCreateIncomeAccount(getIncomeAccountName("DIV", taxExempt),
+        otherAccount = findOrCreateCommodityAccount(getIncomeAccountName("DIV", taxExempt),
                                                  commAcc)
 
         make_transaction(
@@ -2073,6 +2067,79 @@ def updateTransactionList():
           tradeDate, memo, taxExempt, transId,
           scrabGains = doScrab,
           isOptionAssignemnt = isOptionAssignemnt)
+
+  # Now update bank transactions
+  for tran in ofx.stmtResponse.transactions.bankTransactions:
+    if tran in matched:
+      continue
+    commAcc = None
+    acc1Type = tran.subAccountFund  # CASH, MARGIN etc
+    acc1 = getSubAccount(acc1Type)  
+    tranType = tran.transaction.type
+    timePosted = tran.transaction.timePosted
+    amount = tran.transaction.amount
+    memo = tran.transaction.memo
+    transId = tran.transaction.transactionId
+
+    # Lets see if its a duplicate
+    if findIfDuplicate(acc1, timePosted, amount, memo, transId):
+      #print "Found suspected duplicate %s:%s skipping" % (tran.subAccountFund, tran.transaction)
+      continue
+
+    # We don't have access to GUI here, so we can't popup GnuCash "find matching accoun"
+    # dialog.. But a lot of brokereges have a matching pair of transactions daily between
+    # CASH and MARGIN accounts
+    #
+    # Try to find the transaction with either same amount and opposite
+    # TRANTYPE (ie 10k debit from MARGIN is matched with 10k credit
+    # into CASH) or a transaciton with same type, but opposite sign
+    # amounts, ie -10k credit to MARGIN and 10k credit to CASH)
+    #
+    # Otherwise transaction will remain unbalanced, and user will have
+    # to balance it manually
+    #
+    acc2 = None
+    tran2list = [tran2 for tran2 in ofx.stmtResponse.transactions.bankTransactions
+                if tran2 != tran and tran2.subAccountFund != tran.subAccountFund
+                and (tran2.transaction.amount == -amount and tran2.transaction.type != tranType)]
+    if len(tran2list) == 1:
+      print "Found match %s:%s for %s:%s" % (
+        tran.subAccountFund, tran.transaction,
+        tran2list[0].subAccountFund, tran2list[0].transaction)
+      acc2 = getSubAccount(tran2list[0].subAccountFund)
+      matched.append(tran2list[0])
+
+    if acc2 is None and memo.find('PAYMENT IN LIEU OF DIVIDEND') >= 0:
+      match = re.match("(?i)^([A-Z.]+).*PAYMENT IN LIEU.*", memo)
+      assert match
+      acc2name = match.groups()[0]
+      stocks = findAccountByNameOrDie(getAccountPath(brokerAccount) + ":" + brokerage_account_stocks)
+      commAcc = stocks.lookup_by_name(acc2name)
+      if commAcc.get_instance() is not None:
+        otherAccType = "LIEU"
+        otherAccName = getIncomeAccountName(otherAccType, False)
+        acc2 = findOrCreateCommodityAccount(otherAccName, commAcc)
+        make_transaction2(acc1, acc2, tranType, amount, timePosted, memo, transId,
+                          commAcc = commAcc)
+        continue
+      else: acc2 = None
+    
+    # TODO generalize below into a config table
+    if acc2 is None:
+      acc2name = None
+
+      if memo.find("INTEREST ADJUST") >= 0: acc2name = interest_expense_account
+      elif memo.find("US SEC. AND COMM. EXCHANGES") >= 0: acc2name = fees_account
+      elif memo.find(" FEE") >= 0: acc2name = fees_account
+      elif re.match("^USD .* INT FOR.*", memo): acc2name = interest_expense_account
+
+      if acc2name is not None:
+        acc2 = findOrCreateCommodityAccount(acc2name, None)
+
+    print "Adding bank transaction acc1=%s acc2=%s amount=%s" % \
+      (getAccountPath(acc1), getAccountPath(acc2), amount)
+    make_transaction2(acc1, acc2, tranType, amount, timePosted, memo, transId)
+
 
 
 def doMain(gnuCashFileName, ofxFileName, dontSave, adjust_positions):
