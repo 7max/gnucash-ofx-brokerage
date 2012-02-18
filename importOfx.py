@@ -9,7 +9,8 @@ from gnucash.gnucash_core_c import gnc_quote_source_lookup_by_internal, \
      gnc_commodity_equal, gnc_price_create
 from datetime import datetime, timedelta
 from gnucash.gnucash_core_c import ACCT_TYPE_BANK, ACCT_TYPE_CASH, \
-     ACCT_TYPE_STOCK, ACCT_TYPE_MUTUAL, ACCT_TYPE_INCOME, ACCT_TYPE_EXPENSE
+     ACCT_TYPE_STOCK, ACCT_TYPE_MUTUAL, ACCT_TYPE_INCOME, ACCT_TYPE_EXPENSE, \
+     ACCT_TYPE_INVALID, ACCT_TYPE_NONE
 
 from bisect import bisect_right
 from decimal import Decimal
@@ -1098,9 +1099,14 @@ def findOrMakeAccount(account_tuple, root_account, book,
       current_account = Account(book)
       current_account.SetName(current_account_name)
       current_account.SetCommodity(currency)
+      current_account.SetType(acct_type)
       root_account.append_child(current_account)
     
     if len(account_path) > 0:
+      if current_account.GetType() == ACCT_TYPE_NONE or \
+         current_account.GetType() == ACCT_TYPE_INVALID:
+        print "Fixing account type for %s" % (getAccountPath(current_account))
+        current_account.SetType(acct_type)
       return findOrMakeAccount(account_path, current_account, book,
                                     currency, acct_type)
     else:
